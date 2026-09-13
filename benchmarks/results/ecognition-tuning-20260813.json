@@ -1,0 +1,55 @@
+{
+  "plan": {
+    "width": 45280,
+    "height": 36900,
+    "bands": 4,
+    "tiles": 195,
+    "process_layout": "full-width-striped",
+    "tile_size": 3072,
+    "buffer_pixels": 256,
+    "input_copy_bytes": 0,
+    "bridge_sha256": "f6bf51fdc0b711ec0588cb18a5b7b7be43a19c666fcd193885073785824aeac7",
+    "ruleset_sha256": "88938e5e7e4fb125099c2e3485db90dd05dcf4349c6d9cf3ac450a763718fb56"
+  },
+  "representative_tiles": [
+    "r006_c007",
+    "r006_c006",
+    "r006_c008",
+    "r006_c005",
+    "r006_c009",
+    "r006_c004",
+    "r006_c010"
+  ],
+  "memory_limit_mb": 19494.443750000002,
+  "measurements": [
+    {
+      "workers": 4,
+      "seconds": 117.1680244000163,
+      "tiles_per_minute": 3.584595730368409,
+      "peak_memory_mb": 2403.09,
+      "attempts": 7
+    },
+    {
+      "workers": 5,
+      "seconds": 112.4766885000281,
+      "tiles_per_minute": 3.734107090109566,
+      "peak_memory_mb": 3056.54,
+      "attempts": 7
+    },
+    {
+      "workers": 6,
+      "seconds": 107.97735209995881,
+      "tiles_per_minute": 3.8897045707435924,
+      "peak_memory_mb": 3678.5,
+      "attempts": 7
+    },
+    {
+      "workers": 7,
+      "seconds": 75.00460270000622,
+      "tiles_per_minute": 5.599656352822268,
+      "peak_memory_mb": 4254.42,
+      "attempts": 7
+    }
+  ],
+  "selected_workers": 7
+}

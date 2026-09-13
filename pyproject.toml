@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "segassign"
+version = "2.0.2"
+description = "Remote-sensing research automation for segmentation and vector assignment"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    "scipy==1.14.1",
+    "shapely==2.1.2",
+    "geopandas==1.0.1",
+    "pyogrio==0.10.0",
+    "pyproj==3.7.2",
+    "rasterio==1.4.3",
+    "psutil==7.2.2",
+    "PySide6==6.11.1",
+]
+
+[project.gui-scripts]
+segassign-ui = "segassign.ui.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/P-Coke/segassign"
+Issues = "https://github.com/P-Coke/segassign/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/segassign"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q -m 'not external and not fullsize'"
+markers = [
+    "external: invokes the licensed eCognition SDK",
+    "fullsize: processes the complete production raster set",
+    "performance: deterministic local performance gate",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

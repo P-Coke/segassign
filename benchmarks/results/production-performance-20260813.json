@@ -1,0 +1,57 @@
+{
+  "baseline_run_id": "20260812T162044-e7a1758c2ca1",
+  "cold_run": {
+    "v1_seconds": 3181.625,
+    "measured_v2_seconds": 1903.748828,
+    "final_cleanup_increment_seconds": 0.042819099966436625,
+    "v2_seconds": 1903.7916470999664,
+    "speedup": 1.671204411914796,
+    "reduction_fraction": 0.4016291526814233,
+    "required_reduction_fraction": 0.3,
+    "passed": true
+  },
+  "backend_excluding_ecognition": {
+    "method": "total wall time minus sum(tile engine wall seconds) divided by calibrated engine concurrency",
+    "v1_engine_workers": 5,
+    "v1_engine_tile_seconds": 11025.3262565999,
+    "v1_backend_residual_seconds": 976.559748680028,
+    "v2_engine_workers": 7,
+    "v2_engine_tile_seconds": 10186.2483059003,
+    "v2_backend_residual_seconds": 448.61331768564446,
+    "speedup": 2.176840744982809,
+    "required_speedup": 2.0,
+    "passed": true
+  },
+  "conservative_named_stage_comparison": {
+    "note": "This deliberately excludes overlapped tile preparation because the reports do not isolate it from engine execution.",
+    "v1_seconds": 750.869,
+    "v1_stages": {
+      "base_footprint": 151.6,
+      "process_footprint": 123.8,
+      "mosaic": 295.599,
+      "zonal": 179.87
+    },
+    "v2_seconds": 405.10921409996644,
+    "v2_stages": {
+      "footprint": 1.184745,
+      "postprocess": 112.919305,
+      "mosaic": 253.356131,
+      "final_cleanup_increment": 0.042819099966436625,
+      "zonal": 37.605535
+    },
+    "speedup": 1.8534977084345272
+  },
+  "zonal_production": {
+    "v1_seconds": 179.87,
+    "v2_seconds": 37.605535,
+    "speedup": 4.783068102078861,
+    "passed": true
+  },
+  "peak_memory_mb": 8967.16,
+  "physical_memory_limit_fraction": 0.8,
+  "resume": {
+    "process_wall_seconds": 2.6,
+    "reported_total_seconds": 0.0,
+    "passed": true
+  }
+}

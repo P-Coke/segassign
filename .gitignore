@@ -1,0 +1,43 @@
+# Generated packages and local environments
+/build/
+/release/
+/dist/
+.venv*/
+.tools/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Tests and measurements
+.pytest_cache/
+.pytest-tmp*/
+.ruff_cache/
+.mypy_cache/
+.benchmarks/
+.mvp*/
+tests/output/
+tests/work/
+tests/logs/
+tests/temp/
+
+# Business data and generated runtime state
+/data/
+/Data/
+/work/
+/logs/
+/sandbox/
+.geotoolbox-work/
+.geotoolbox-segment/
+/config/config.json
+/.prj
+
+# Secrets, editor and OS state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

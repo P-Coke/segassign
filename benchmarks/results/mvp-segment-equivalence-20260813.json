@@ -1,0 +1,19 @@
+{
+  "reference": "E:/Project/ToolBox/tests/output/segment/mvp/root/dfhy_mvp/dfhy_mvp_segment.shp",
+  "candidate": "E:/Project/GeoToolBox-v2/.mvp/output/dfhy_mvp_segment.shp",
+  "crs_equal": true,
+  "feature_count": {
+    "reference": 125,
+    "candidate": 125
+  },
+  "required_fields_equal": true,
+  "missing_keys": 0,
+  "extra_keys": 0,
+  "attribute_mismatches": 0,
+  "geometry_mismatches": 0,
+  "geometry_tolerance_degrees": 1e-9,
+  "symmetric_difference_area_ratio": 0.0,
+  "candidate_empty_geometries": 0,
+  "candidate_invalid_geometries": 0,
+  "passed": true
+}
