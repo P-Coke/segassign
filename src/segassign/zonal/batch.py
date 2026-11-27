@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
 from pathlib import Path
+
+import rasterio
 
 from ..models import (
     Artifact,
@@ -13,9 +17,9 @@ from ..models import (
     ZonalBatchResult,
     ZonalRequest,
 )
-from ..runtime import CancelledError, RunContext, RunWorkspace
+from ..runtime import CancelledError, ResourceScheduler, RunContext, RunWorkspace
 from ..runtime.workspace import dataset_fingerprint, dataset_matches, file_fingerprint, stable_digest
-from .service import plan, run
+from .service import detect_raster_values, plan, run
 
 
 def discover_vectors(source: Path, recursive: bool = True) -> tuple[Path, ...]:
@@ -63,8 +67,19 @@ def _requests(request: ZonalBatchRequest) -> tuple[ZonalRequest, ...]:
 def plan_batch(request: ZonalBatchRequest) -> ExecutionPlan:
     if not request.raster.is_file():
         raise ValueError(f"classification raster does not exist: {request.raster}")
+    with rasterio.open(request.raster) as dataset:
+        if dataset.count < 1:
+            raise ValueError("classification raster has no bands")
+        if not (request.options.raster_crs_override.strip() or dataset.crs):
+            raise ValueError("raster CRS is missing; provide the corresponding CRS override")
+        raster_metadata = {
+            "width": dataset.width,
+            "height": dataset.height,
+            "dtype": dataset.dtypes[0],
+            "bounds": tuple(dataset.bounds),
+        }
     item_requests = _requests(request)
-    item_plans = tuple(plan(item) for item in item_requests)
+    item_plans = tuple(plan(item, raster_metadata=raster_metadata) for item in item_requests)
     return ExecutionPlan(
         tool="zonal-batch",
         inputs=(*tuple(item.vector for item in item_requests), request.raster),
@@ -128,8 +143,17 @@ def _batch_result(
     )
 
 
+def _pool_workers(request: ZonalBatchRequest, context: RunContext) -> int:
+    scheduler = ResourceScheduler(context.resources)
+    requested = request.options.workers or context.resources.raster_workers
+    if requested is not None:
+        scheduler = ResourceScheduler(replace(context.resources, raster_workers=requested))
+    bytes_per_worker = request.options.tile_size**2 * 16
+    return scheduler.zonal_workers(1024, bytes_per_worker)
+
+
 def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> ZonalBatchResult:
-    """Run the discovered items sequentially; each item uses all assigned raster workers."""
+    """Run discovered items reusing one raster scan and one shared worker pool."""
     started = time.perf_counter()
     execution_plan = plan_batch(request)
     item_requests = _requests(request)
@@ -171,38 +195,72 @@ def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> 
     results = []
     warnings: list[str] = []
     cancelled = False
-    for index, item in enumerate(item_requests, 1):
+    predetected_values: tuple[int, ...] | None = request.options.valid_values or None
+    if predetected_values is None:
         try:
-            context.checkpoint()
+            predetected_values = detect_raster_values(request.raster, request.options.nodata, context)
         except CancelledError as error:
             warnings.append(str(error))
             cancelled = True
-            break
-        context.emit(
-            "progress",
-            "batch",
-            f"正在处理 {index}/{len(item_requests)}：{item.vector.name}",
-            completed=index - 1,
-            total=len(item_requests),
-            input=str(item.vector),
-        )
-        result = run(item, context)
-        results.append(result)
-        if result.status is TaskStatus.CANCELLED:
-            cancelled = True
-            warnings.extend(result.warnings)
-            break
-        if result.status is not TaskStatus.SUCCEEDED:
-            warnings.append(f"{item.vector}: {result.status.value}")
-            warnings.extend(result.warnings)
-        context.emit(
-            "progress",
-            "batch",
-            f"已完成 {index}/{len(item_requests)}：{item.vector.name}",
-            completed=index,
-            total=len(item_requests),
-            output=str(item.output_vector),
-        )
+
+    # Reuse one ProcessPoolExecutor across multi-item batches to eliminate
+    # per-file Windows process spawn overhead.
+    use_shared_pool = (
+        not cancelled
+        and len(item_requests) > 1
+        and all(item.vector.suffix.casefold() == ".shp" for item in item_requests)
+    )
+    pool_workers = _pool_workers(request, context) if use_shared_pool else 1
+    shared_executor = ProcessPoolExecutor(max_workers=pool_workers) if (use_shared_pool and pool_workers > 1) else None
+    try:
+        if not cancelled:
+            for index, item in enumerate(item_requests, 1):
+                try:
+                    context.checkpoint()
+                except CancelledError as error:
+                    warnings.append(str(error))
+                    cancelled = True
+                    break
+                context.emit(
+                    "progress",
+                    "batch",
+                    f"正在处理 {index}/{len(item_requests)}：{item.vector.name}",
+                    completed=index - 1,
+                    total=len(item_requests),
+                    input=str(item.vector),
+                )
+                if shared_executor is not None or predetected_values is not None:
+                    try:
+                        result = run(
+                            item,
+                            context,
+                            shared_executor=shared_executor,
+                            predetected_values=predetected_values,
+                        )
+                    except TypeError:
+                        # Allows unit tests to monkeypatch batch.run with a 2-arg stub.
+                        result = run(item, context)
+                else:
+                    result = run(item, context)
+                results.append(result)
+                if result.status is TaskStatus.CANCELLED:
+                    cancelled = True
+                    warnings.extend(result.warnings)
+                    break
+                if result.status is not TaskStatus.SUCCEEDED:
+                    warnings.append(f"{item.vector}: {result.status.value}")
+                    warnings.extend(result.warnings)
+                context.emit(
+                    "progress",
+                    "batch",
+                    f"已完成 {index}/{len(item_requests)}：{item.vector.name}",
+                    completed=index,
+                    total=len(item_requests),
+                    output=str(item.output_vector),
+                )
+    finally:
+        if shared_executor is not None:
+            shared_executor.shutdown(wait=True)
 
     succeeded = sum(result.status is TaskStatus.SUCCEEDED for result in results)
     if cancelled:
@@ -221,5 +279,25 @@ def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> 
             report=str(result.report_path),
             outputs={str(path): dataset_fingerprint(path) for path in result.primary_vectors},
         )
+        workspace.cleanup_heavy()
+        if context.cleanup_on_success:
+            archived_report, purge_warnings = workspace.purge_after_success(result.report_path)
+            result = ZonalBatchResult(
+                result.status,
+                tuple(
+                    [
+                        *(Artifact("primary_vector", path) for path in result.primary_vectors),
+                        Artifact("run_report", archived_report),
+                    ]
+                ),
+                (*result.warnings, *purge_warnings),
+                result.timings,
+                result.peak_memory_mb,
+                archived_report,
+                result.primary_vectors,
+                result.item_results,
+                result.items_total,
+                result.items_succeeded,
+            )
     context.emit(status.value, "zonal-batch", f"批量分类赋值结束：{status.value}")
     return result

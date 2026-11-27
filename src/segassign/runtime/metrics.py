@@ -12,7 +12,7 @@ import psutil
 class PeakMemoryTracker(AbstractContextManager["PeakMemoryTracker"]):
     """Sample this process and its children without holding up useful work."""
 
-    def __init__(self, interval: float = 0.1) -> None:
+    def __init__(self, interval: float = 0.5) -> None:
         self.interval = interval
         self.peak_bytes = 0
         self._stop = threading.Event()

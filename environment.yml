@@ -6,7 +6,6 @@ dependencies:
   - python=3.11.15
   - numpy=1.26.4
   - pandas=2.2.3
-  - scipy=1.14.1
   - shapely=2.1.2
   - geopandas=1.0.1
   - pyogrio=0.10.0

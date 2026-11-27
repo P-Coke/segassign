@@ -116,8 +116,6 @@ class SegmentOptions:
     max_attempts: int = 3
     timeout_seconds: float = 1800.0
     tile_compression: str = "none"
-    footprint_scale: int = 8
-    footprint_close_pixels: int = 2
     postprocess_max_tiles_per_worker: int = 8
 
     def __post_init__(self) -> None:
@@ -131,14 +129,8 @@ class SegmentOptions:
             raise ValueError("postprocess_workers must be positive")
         if self.ruleset_mode not in {"plain", "invalid_classify"}:
             raise ValueError("ruleset_mode must be plain or invalid_classify")
-        if self.footprint_scale < 1:
-            raise ValueError("footprint_scale must be positive")
-        if self.footprint_close_pixels < 0:
-            raise ValueError("footprint_close_pixels cannot be negative")
         if self.postprocess_max_tiles_per_worker < 1:
             raise ValueError("postprocess_max_tiles_per_worker must be positive")
-        if self.tile_size % self.footprint_scale:
-            raise ValueError("tile_size must be divisible by footprint_scale for a stable global sample grid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +157,33 @@ class SegmentRequest:
             object.__setattr__(self, name, _absolute(getattr(self, name)))
         if self.output_vector.suffix.casefold() != ".shp":
             raise ValueError("segment output_vector must be a .shp path")
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentBatchRequest:
+    """Segment one raster or a directory tree of rasters into an output directory."""
+
+    process_source: Path
+    base_source: Path
+    output_directory: Path
+    ecognition_bin: Path
+    ruleset: Path = field(default_factory=lambda: asset_path("rulesets", "segment.dcp"))
+    invalid_ruleset: Path = field(default_factory=lambda: asset_path("rulesets", "invalid-class.dcp"))
+    bridge: Path = field(default_factory=lambda: asset_path("vendor", "ecognition-9", "bridge.exe"))
+    options: SegmentOptions = field(default_factory=SegmentOptions)
+    recursive: bool = True
+
+    def __post_init__(self) -> None:
+        for name in (
+            "process_source",
+            "base_source",
+            "output_directory",
+            "ecognition_bin",
+            "ruleset",
+            "invalid_ruleset",
+            "bridge",
+        ):
+            object.__setattr__(self, name, _absolute(getattr(self, name)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +265,36 @@ class CompositeRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class CompositeBatchRequest:
+    """Segment and assign one raster or a directory tree of rasters into an output directory."""
+
+    process_source: Path
+    base_source: Path
+    classification_source: Path
+    output_directory: Path
+    ecognition_bin: Path
+    ruleset: Path = field(default_factory=lambda: asset_path("rulesets", "segment.dcp"))
+    invalid_ruleset: Path = field(default_factory=lambda: asset_path("rulesets", "invalid-class.dcp"))
+    bridge: Path = field(default_factory=lambda: asset_path("vendor", "ecognition-9", "bridge.exe"))
+    segment_options: SegmentOptions = field(default_factory=SegmentOptions)
+    zonal_options: ZonalOptions = field(default_factory=ZonalOptions)
+    recursive: bool = True
+
+    def __post_init__(self) -> None:
+        for name in (
+            "process_source",
+            "base_source",
+            "classification_source",
+            "output_directory",
+            "ecognition_bin",
+            "ruleset",
+            "invalid_ruleset",
+            "bridge",
+        ):
+            object.__setattr__(self, name, _absolute(getattr(self, name)))
+
+
+@dataclass(frozen=True, slots=True)
 class BackendResult:
     status: TaskStatus
     artifacts: tuple[Artifact, ...]
@@ -271,6 +320,19 @@ class SegmentResult(BackendResult):
     def __post_init__(self) -> None:
         BackendResult.__post_init__(self)
         object.__setattr__(self, "primary_vector", _absolute(self.primary_vector))
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentBatchResult(BackendResult):
+    primary_vectors: tuple[Path, ...]
+    item_results: tuple[SegmentResult, ...]
+    items_total: int
+    items_succeeded: int
+
+    def __post_init__(self) -> None:
+        BackendResult.__post_init__(self)
+        object.__setattr__(self, "primary_vectors", _paths(self.primary_vectors))
+        object.__setattr__(self, "item_results", tuple(self.item_results))
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,3 +368,16 @@ class CompositeResult(BackendResult):
     def __post_init__(self) -> None:
         BackendResult.__post_init__(self)
         object.__setattr__(self, "primary_vector", _absolute(self.primary_vector))
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeBatchResult(BackendResult):
+    primary_vectors: tuple[Path, ...]
+    item_results: tuple[CompositeResult, ...]
+    items_total: int
+    items_succeeded: int
+
+    def __post_init__(self) -> None:
+        BackendResult.__post_init__(self)
+        object.__setattr__(self, "primary_vectors", _paths(self.primary_vectors))
+        object.__setattr__(self, "item_results", tuple(self.item_results))

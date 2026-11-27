@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import rasterio
 from rasterio.errors import RasterioIOError
 from rasterio.windows import Window
@@ -45,12 +47,14 @@ class RasterWindowReader:
         self.role = role
         self.context = context
         self.max_attempts = max_attempts
+        self._lock = threading.Lock()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        self._discard()
+        with self._lock:
+            self._discard()
 
     def _discard(self):
         if self.dataset is not None and self.dataset is not self.source:
@@ -68,29 +72,41 @@ class RasterWindowReader:
             "attempts": 0,
             "errors": [],
         }
-        for attempt in range(1, self.max_attempts + 1):
-            if self.context is not None:
-                self.context.checkpoint()
-            try:
-                if self.dataset is None:
-                    self.dataset = rasterio.open(self.source.name, sharing=False, NUM_THREADS="1")
-                data = self.dataset.read(window=window, masked=True)
-                if attempt > 1 and self.context is not None:
-                    self.context.emit(
-                        "warning", "prepare", f"重新打开后读取成功：{self.source.name}（第 {attempt} 次尝试）",
-                        source=str(self.source.name), tile_ids=tile_ids, attempts=attempt,
-                    )
-                return data
-            except RasterioIOError as error:
-                self._discard()
-                diagnostic["attempts"] = attempt
-                diagnostic["errors"].append(_error_chain(error))
-                if attempt == self.max_attempts:
-                    raise RasterReadError(diagnostic) from error
+        with self._lock:
+            for attempt in range(1, self.max_attempts + 1):
                 if self.context is not None:
-                    self.context.emit(
-                        "warning", "prepare",
-                        f"影像读取失败，正在重新打开并重试（{attempt + 1}/{self.max_attempts}）：{self.source.name}",
-                        source=str(self.source.name), role=self.role, tile_ids=tile_ids,
-                        window=diagnostic["window"], error=diagnostic["errors"][-1],
-                    )
+                    self.context.checkpoint()
+                try:
+                    if self.dataset is None:
+                        self.dataset = rasterio.open(self.source.name, sharing=False, NUM_THREADS="1")
+                    data = self.dataset.read(window=window, masked=True)
+                    if attempt > 1 and self.context is not None:
+                        self.context.emit(
+                            "warning",
+                            "prepare",
+                            f"重新打开后读取成功：{self.source.name}（第 {attempt} 次尝试）",
+                            source=str(self.source.name),
+                            tile_ids=tile_ids,
+                            attempts=attempt,
+                        )
+                    return data
+                except RasterioIOError as error:
+                    self._discard()
+                    diagnostic["attempts"] = attempt
+                    diagnostic["errors"].append(_error_chain(error))
+                    if attempt == self.max_attempts:
+                        raise RasterReadError(diagnostic) from error
+                    if self.context is not None:
+                        message = (
+                            f"影像读取失败，正在重新打开并重试（{attempt + 1}/{self.max_attempts}）：{self.source.name}"
+                        )
+                        self.context.emit(
+                            "warning",
+                            "prepare",
+                            message,
+                            source=str(self.source.name),
+                            role=self.role,
+                            tile_ids=tile_ids,
+                            window=diagnostic["window"],
+                            error=diagnostic["errors"][-1],
+                        )

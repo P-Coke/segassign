@@ -84,6 +84,8 @@ def wait_for_external_engines(context: RunContext, poll_seconds: float = 1.0) ->
                 )
                 reported = current
         else:
+            if not reported:
+                return
             idle_since = idle_since or now
             if now - idle_since >= 2.0:
                 return
@@ -195,7 +197,11 @@ def _publish_export(source: Path, tile_dir: Path) -> Path:
     directory.mkdir()
     destination = directory / "ObjectShapes.shp"
     for sidecar in source.parent.glob(source.stem + ".*"):
-        shutil.copy2(sidecar, destination.with_suffix(sidecar.suffix))
+        target = destination.with_suffix(sidecar.suffix)
+        try:
+            os.replace(sidecar, target)
+        except OSError:
+            shutil.copy2(sidecar, target)
     if not _complete_vector(destination):
         raise RuntimeError(f"eCognition export is incomplete after publication: {destination}")
     return destination

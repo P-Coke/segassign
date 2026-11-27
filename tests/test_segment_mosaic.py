@@ -12,7 +12,7 @@ from segassign.segment.mosaic import (
     _subtract_main,
     assemble,
 )
-from segassign.segment.postprocess import _intersecting_positions
+from segassign.segment.postprocess import _compute_seam_band, _intersecting_positions
 
 
 def test_subtract_main_drops_only_subpixel_overlay_debris():
@@ -144,4 +144,47 @@ def test_assemble_multiple_tiles_keeps_attributes_and_hides_internal_fields(tmp_
     assert assemble(sources, destination, pixel_area=1.0) == 2
     written = pyogrio.read_dataframe(destination)
     assert written["name"].tolist() == ["feature-0", "feature-1"]
-    assert not {"tile_id", "source_fid", "gap_fill"}.intersection(written.columns)
+    assert not {"tile_id", "source_fid", "gap_fill", "seam_band"}.intersection(written.columns)
+
+
+def test_seam_band_tags_only_boundary_and_supplement_adjacent_main_polygons():
+    core_bounds = (0.0, 0.0, 10.0, 10.0)
+    interior = box(3, 3, 5, 5)
+    touches_edge = box(0, 4, 2, 6)
+    crosses_edge = box(9, 4, 11, 6)
+    near_supp = box(5.5, 5.5, 7, 7)
+    main_geoms = gpd.GeoSeries([interior, touches_edge, crosses_edge, near_supp]).array
+    supp_geoms = gpd.GeoSeries([box(6.5, 6.5, 9.5, 9.5)]).array
+
+    flags = _compute_seam_band(main_geoms, supp_geoms, core_bounds)
+
+    assert flags.tolist() == [0, 1, 1, 1]
+
+
+def test_assemble_reads_fgb_tile_caches_and_filters_seam_band(tmp_path):
+    sources = []
+    for position in range(2):
+        source = tmp_path / f"tile-{position}.fgb"
+        frame = gpd.GeoDataFrame(
+            {
+                "name": [f"main-{position}", f"supp-{position}"],
+                "gap_fill": [0, 1],
+                "seam_band": [1 if position == 0 else 0, 1],
+                "source_fid": [position * 2, position * 2 + 1],
+                "tile_id": [f"r000_c00{position}"] * 2,
+            },
+            geometry=[
+                box(position * 2, 0, position * 2 + 2, 2),
+                box(0, 0, 2, 2) if position == 1 else box(4, 0, 5, 1),
+            ],
+            crs="EPSG:3857",
+        )
+        pyogrio.write_dataframe(frame, source, driver="FlatGeobuf", spatial_index=False)
+        sources.append(source)
+    destination = tmp_path / "assembled_from_fgb.shp"
+
+    count = assemble(sources, destination, pixel_area=1.0)
+    assert count == 3  # supp-1 was fully covered by main-0 (seam_band=1) and removed
+    written = pyogrio.read_dataframe(destination)
+    assert not {"tile_id", "source_fid", "gap_fill", "seam_band"}.intersection(written.columns)
+    assert written.geometry.is_valid.all()

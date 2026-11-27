@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import geopandas as gpd
@@ -15,7 +14,6 @@ from rasterio.errors import WindowError
 from rasterio.transform import Affine, array_bounds
 from rasterio.warp import reproject, transform_bounds
 from rasterio.windows import Window
-from scipy import ndimage
 from shapely import make_valid, union_all
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box, shape
 
@@ -40,17 +38,23 @@ def valid_mask(data, invalid_values: tuple[int, ...]) -> np.ndarray:
     if array.ndim != 3:
         raise ValueError(f"expected (bands, rows, columns), got {array.shape}")
     result = np.ones(array.shape[1:], dtype=bool)
-    source_mask = np.ma.getmaskarray(data) if np.ma.isMaskedArray(data) else None
-    for band_index, band in enumerate(array):
+    if np.ma.isMaskedArray(data):
+        source_mask = np.ma.getmaskarray(data)
+        if source_mask.ndim == 3:
+            result &= ~np.any(source_mask, axis=0)
+        elif source_mask.ndim == 2:
+            result &= ~source_mask
+    if invalid_values:
         for value in invalid_values:
-            result &= band != value
-        if source_mask is not None:
-            result &= ~source_mask[band_index]
+            result &= np.all(array != value, axis=0)
     return result
 
 
 def clean(data, valid: np.ndarray) -> np.ndarray:
-    result = np.ma.getdata(data).copy()
+    raw = np.ma.getdata(data)
+    if valid.all():
+        return raw
+    result = raw.copy()
     result[:, ~valid] = 0
     return result
 
@@ -86,7 +90,8 @@ class BlockAwareReader:
         top = min(int(tile.buffer.row_off) for tile in tiles)
         bottom = max(int(tile.buffer.row_off + tile.buffer.height) for tile in tiles)
         stripe = self.reader.read(
-            Window(0, top, self.dataset.width, bottom - top), tile_ids=tuple(tile.tile_id for tile in tiles),
+            Window(0, top, self.dataset.width, bottom - top),
+            tile_ids=tuple(tile.tile_id for tile in tiles),
         )
         result = {}
         for tile in tiles:
@@ -103,7 +108,8 @@ class BlockAwareReader:
 def _polygonal(geometry):
     if geometry is None or geometry.is_empty:
         return None
-    geometry = make_valid(geometry)
+    if not geometry.is_valid:
+        geometry = make_valid(geometry)
     if isinstance(geometry, (Polygon, MultiPolygon)):
         return geometry
     if isinstance(geometry, GeometryCollection):
@@ -116,11 +122,12 @@ def _polygonal(geometry):
 def polygonize_mask(mask: np.ndarray, transform: Affine):
     if not mask.any():
         return []
+    contiguous = np.ascontiguousarray(mask, dtype=np.uint8)
     return [
         _polygonal(shape(mapping))
         for mapping, value in features.shapes(
-            np.ascontiguousarray(mask, dtype=np.uint8),
-            mask=np.ascontiguousarray(mask, dtype=bool),
+            contiguous,
+            mask=contiguous.view(bool),
             transform=transform,
         )
         if value == 1
@@ -149,8 +156,11 @@ def reproject_valid_once(
     height: int,
     width: int,
     invalid_values: tuple[int, ...],
+    *,
+    base_valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    source = valid_mask(base_data, invalid_values).astype(np.uint8)
+    source_mask = base_valid_mask if base_valid_mask is not None else valid_mask(base_data, invalid_values)
+    source = np.ascontiguousarray(source_mask, dtype=np.uint8)
     destination = np.zeros((height, width), dtype=np.uint8)
     reproject(
         source,
@@ -194,7 +204,7 @@ def prepare_tile(
     process_data,
     options: SegmentOptions,
     base_reader: RasterWindowReader | None = None,
-) -> np.ndarray:
+) -> None:
     process_crs = resolve_crs(process_dataset, options.default_crs)
     base_crs = resolve_crs(base_dataset, options.default_crs)
     process_mask = valid_mask(process_data, options.invalid_pixel_values)
@@ -205,20 +215,8 @@ def prepare_tile(
         slice(relative_row, relative_row + int(tile.core.height)),
         slice(relative_column, relative_column + int(tile.core.width)),
     )
-    # Persist this before base-overlap checks: the global footprint describes
-    # the process raster itself and therefore must not depend on winter validity.
-    core_band = np.ma.getdata(process_data)[0][core_slice]
-    if np.ma.isMaskedArray(process_data):
-        core_source_mask = ~np.ma.getmaskarray(process_data)[0][core_slice]
-    else:
-        core_source_mask = np.ones(core_band.shape, dtype=bool)
-    sample = (
-        core_source_mask[:: options.footprint_scale, :: options.footprint_scale]
-        & (core_band[:: options.footprint_scale, :: options.footprint_scale] != 0)
-        & (core_band[:: options.footprint_scale, :: options.footprint_scale] != 65535)
-    )
-    tile_dir.mkdir(parents=True, exist_ok=True)
-    np.save(tile_dir / "process_sample.npy", sample)
+    if not process_mask[core_slice].any():
+        raise SkipTile(f"{tile.tile_id} has no valid process pixels in its core ownership area")
     base_bounds = (
         transform_bounds(process_crs, base_crs, *tile.buffer_bounds, densify_pts=21)
         if process_crs != base_crs
@@ -238,6 +236,9 @@ def prepare_tile(
             base_data = temporary_reader.read(base_window, tile_ids=(tile.tile_id,))
     else:
         base_data = base_reader.read(base_window, tile_ids=(tile.tile_id,))
+    base_mask = valid_mask(base_data, options.invalid_pixel_values)
+    if not base_mask.any():
+        raise SkipTile(f"{tile.tile_id} has no valid base pixels in its overlap window")
     buffer_base_mask = reproject_valid_once(
         base_data,
         base_dataset.window_transform(base_window),
@@ -247,6 +248,7 @@ def prepare_tile(
         int(tile.buffer.height),
         int(tile.buffer.width),
         options.invalid_pixel_values,
+        base_valid_mask=base_mask,
     )
     core_valid = process_mask[core_slice] & buffer_base_mask[core_slice]
     if not core_valid.any():
@@ -266,7 +268,7 @@ def prepare_tile(
         "w",
         **_tile_profile(base_dataset, base_window, base_crs, options.tile_compression),
     ) as output:
-        output.write(clean(base_data, valid_mask(base_data, options.invalid_pixel_values)))
+        output.write(clean(base_data, base_mask))
     write_mask(vector_dir / "valid_buffer.shp", process_mask & buffer_base_mask, buffer_transform, process_crs)
     write_mask(
         vector_dir / "valid_core.shp",
@@ -274,26 +276,3 @@ def prepare_tile(
         process_dataset.window_transform(tile.core),
         process_crs,
     )
-
-    return sample
-
-
-def assemble_process_footprint(
-    tiles: list[Tile], tile_root: Path, width: int, height: int, transform: Affine, crs: CRS, options: SegmentOptions
-) -> Path:
-    scale = options.footprint_scale
-    sampled = np.zeros((math.ceil(height / scale), math.ceil(width / scale)), dtype=bool)
-    for tile in tiles:
-        path = tile_root / tile.tile_id / "process_sample.npy"
-        if not path.exists():
-            continue
-        block = np.load(path, allow_pickle=False)
-        row = int(tile.core.row_off) // scale
-        column = int(tile.core.col_off) // scale
-        sampled[row : row + block.shape[0], column : column + block.shape[1]] = block
-    if options.footprint_close_pixels:
-        sampled = ndimage.binary_closing(sampled, iterations=options.footprint_close_pixels)
-    sampled = ndimage.binary_fill_holes(sampled)
-    output = tile_root.parent / "process_valid_footprint.shp"
-    write_mask(output, sampled, transform * Affine.scale(scale, scale), crs)
-    return output

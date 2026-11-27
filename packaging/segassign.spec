@@ -23,6 +23,9 @@ hidden_imports = [
     "pyogrio.raw",
     *collect_submodules("rasterio"),
     *collect_submodules("pyproj"),
+    "segassign.raster_batch",
+    "segassign.runtime.hardware",
+    "segassign.segment.batch",
     "segassign.ui.main_window",
     "segassign.zonal.batch",
 ]
@@ -36,7 +39,7 @@ analysis = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["IPython", "matplotlib", "notebook", "pytest", "tkinter"],
+    excludes=["IPython", "matplotlib", "notebook", "pytest", "scipy", "sklearn", "tkinter"],
     noarchive=False,
     optimize=0,
 )

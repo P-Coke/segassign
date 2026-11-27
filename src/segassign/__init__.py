@@ -2,10 +2,14 @@
 
 from . import composite, segment, zonal
 from .models import (
+    CompositeBatchRequest,
+    CompositeBatchResult,
     CompositeRequest,
     CompositeResult,
     ExecutionPlan,
     ResourceBudget,
+    SegmentBatchRequest,
+    SegmentBatchResult,
     SegmentOptions,
     SegmentRequest,
     SegmentResult,
@@ -20,19 +24,23 @@ from .models import (
 from .runtime import RunContext
 
 __all__ = [
+    "CompositeBatchRequest",
+    "CompositeBatchResult",
     "CompositeRequest",
     "CompositeResult",
     "ExecutionPlan",
     "ResourceBudget",
     "RunContext",
+    "SegmentBatchRequest",
+    "SegmentBatchResult",
     "SegmentOptions",
     "SegmentRequest",
     "SegmentResult",
     "TaskEvent",
     "TaskStatus",
-    "ZonalOptions",
     "ZonalBatchRequest",
     "ZonalBatchResult",
+    "ZonalOptions",
     "ZonalRequest",
     "ZonalResult",
     "composite",

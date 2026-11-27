@@ -56,6 +56,7 @@ class TaskController(QObject):
         work_dir: Path,
         resume: bool,
         resources: ResourceBudget | None = None,
+        cleanup_on_success: bool = True,
     ) -> None:
         if self.running:
             raise RuntimeError("a task is already running")
@@ -67,6 +68,7 @@ class TaskController(QObject):
             event_sink=self._events,
             resources=resources or ResourceBudget(),
             resume=resume,
+            cleanup_on_success=cleanup_on_success,
         )
         thread = QThread(self)
         worker = _BackendWorker(run, request, context)

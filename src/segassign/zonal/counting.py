@@ -62,23 +62,6 @@ def rasterize_labels(geometries, candidates: np.ndarray, shape, transform) -> np
         )
 
 
-def bincount_window(
-    pixels: np.ndarray,
-    labels: np.ndarray,
-    candidates: np.ndarray,
-    encoding: ClassEncoding,
-    nodata: int,
-) -> dict[int, dict[int, int]]:
-    counts = bincount_rows(pixels, labels, candidates, encoding, nodata)
-    result: dict[int, dict[int, int]] = {}
-    for local_position in np.flatnonzero(counts.sum(axis=1)):
-        row = counts[local_position]
-        result[int(candidates[local_position])] = {
-            int(encoding.values[class_index]): int(row[class_index]) for class_index in np.flatnonzero(row)
-        }
-    return result
-
-
 def bincount_rows(
     pixels: np.ndarray,
     labels: np.ndarray,
@@ -86,22 +69,31 @@ def bincount_rows(
     encoding: ClassEncoding,
     nodata: int,
 ) -> np.ndarray:
-    """Return one dense class-count row per local candidate.
-
-    Keeping the hot path numeric avoids converting every raster window to and
-    from nested Python dictionaries. The compatibility wrapper above exists
-    only for small reference tests.
-    """
+    """Return one dense class-count row per local candidate."""
     class_count = int(encoding.values.size)
-    empty = np.zeros((int(candidates.size), class_count), dtype=np.int64)
+    candidate_count = int(candidates.size)
+    empty = np.zeros((candidate_count, class_count), dtype=np.int64)
+    if candidate_count == 0 or class_count == 0:
+        return empty
+    total_bins = (candidate_count + 1) * class_count
     if encoding.contiguous_start is not None:
         start = encoding.contiguous_start
-        # One vector expression is materially cheaper than compacting pixel and
-        # label arrays independently. Invalid pixels map to bin zero and are
-        # discarded with the background label row.
-        valid = (labels > 0) & (pixels != nodata) & (pixels >= start) & (pixels < start + class_count)
-        flat = np.where(valid, labels * class_count + (pixels - start), 0).ravel()
-        counts = np.bincount(flat, minlength=(int(candidates.size) + 1) * class_count).reshape(-1, class_count)
+        stop = start + class_count
+        # Skip the nodata comparison when nodata is already outside [start, stop).
+        valid = (labels > 0) & (pixels >= start) & (pixels < stop)
+        if start <= nodata < stop:
+            valid &= pixels != nodata
+        if not valid.any():
+            return empty
+        # Use 32-bit bin indices when safe to halve memory bandwidth on large tiles.
+        if total_bins < 2**31:
+            idx_dtype = np.int32
+        else:
+            idx_dtype = np.int64
+        selected_labels = labels[valid].astype(idx_dtype, copy=False)
+        selected_classes = (pixels[valid] - start).astype(idx_dtype, copy=False)
+        flat = selected_labels * idx_dtype(class_count) + selected_classes
+        counts = np.bincount(flat, minlength=total_bins).reshape(-1, class_count)
         return counts[1:]
     mask = (labels > 0) & (pixels != nodata)
     if not mask.any():
@@ -120,44 +112,12 @@ def bincount_rows(
     valid = class_ids >= 0
     if not valid.any():
         return empty
-    feature_labels = selected_labels[valid].astype(np.int64, copy=False)
-    class_ids = class_ids[valid].astype(np.int64, copy=False)
-    flat = feature_labels * class_count + class_ids
-    counts = np.bincount(flat, minlength=(int(candidates.size) + 1) * class_count).reshape(-1, class_count)
+    idx_dtype = np.int32 if total_bins < 2**31 else np.int64
+    feature_labels = selected_labels[valid].astype(idx_dtype, copy=False)
+    class_ids = class_ids[valid].astype(idx_dtype, copy=False)
+    flat = feature_labels * idx_dtype(class_count) + class_ids
+    counts = np.bincount(flat, minlength=total_bins).reshape(-1, class_count)
     return counts[1:]
-
-
-def merge_counts(target: dict[int, dict[int, int]], source: dict[int, dict[int, int]]) -> None:
-    for position, values in source.items():
-        row = target.setdefault(position, {})
-        for value, count in values.items():
-            row[value] = row.get(value, 0) + count
-
-
-def statistic_row(counts: dict[int, int], ranks: int, threshold: int) -> dict[str, int]:
-    result = {"class": 0}
-    for rank in range(1, ranks + 1):
-        result[f"v{rank}"] = 0
-        result[f"v{rank}p"] = 0
-    if not counts:
-        return result
-    total = sum(counts.values())
-    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    for rank, (value, count) in enumerate(ordered[:ranks], 1):
-        result[f"v{rank}"] = value
-        result[f"v{rank}p"] = int(round(count * 100.0 / total))
-    result["class"] = result["v1"] if result["v1p"] >= threshold else 0
-    return result
-
-
-def statistics_frame(counts: dict[int, dict[int, int]], feature_count: int, ranks: int, threshold: int) -> pd.DataFrame:
-    columns = ["class", *(name for rank in range(1, ranks + 1) for name in (f"v{rank}", f"v{rank}p"))]
-    matrix = np.zeros((feature_count, len(columns)), dtype=np.int16)
-    column_positions = {name: position for position, name in enumerate(columns)}
-    for feature_position, value_counts in counts.items():
-        for name, value in statistic_row(value_counts, ranks, threshold).items():
-            matrix[feature_position, column_positions[name]] = np.int16(value)
-    return pd.DataFrame(matrix, columns=columns)
 
 
 def statistics_frame_dense(counts: np.ndarray, values: np.ndarray, threshold: int) -> pd.DataFrame:
@@ -172,13 +132,16 @@ def statistics_frame_dense(counts: np.ndarray, values: np.ndarray, threshold: in
     order = np.argsort(-counts, axis=1, kind="stable")
     ordered_counts = np.take_along_axis(counts, order, axis=1)
     totals = counts.sum(axis=1)
+    has_total = totals > 0
+    inv_totals = np.zeros(counts.shape[0], dtype=np.float64)
+    inv_totals[has_total] = 100.0 / totals[has_total]
     for rank in range(ranks):
         present = ordered_counts[:, rank] > 0
         matrix[present, 1 + rank * 2] = values[order[present, rank]].astype(np.int16)
-        percentages = np.zeros(counts.shape[0], dtype=np.int16)
-        has_total = totals > 0
-        percentages[has_total] = np.rint(ordered_counts[has_total, rank] * 100.0 / totals[has_total]).astype(np.int16)
-        matrix[:, 2 + rank * 2] = percentages
+        if has_total.any():
+            matrix[has_total, 2 + rank * 2] = np.rint(
+                ordered_counts[has_total, rank] * inv_totals[has_total]
+            ).astype(np.int16)
     accepted = matrix[:, 2] >= threshold
     matrix[accepted, 0] = matrix[accepted, 1]
     return pd.DataFrame(matrix, columns=columns)

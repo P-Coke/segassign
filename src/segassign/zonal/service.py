@@ -6,6 +6,7 @@ import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -73,7 +74,7 @@ def _geometry_bounds(geometries) -> tuple[float, float, float, float] | None:
     )
 
 
-def _preflight(request: ZonalRequest) -> dict:
+def _preflight(request: ZonalRequest, *, raster_metadata: dict | None = None) -> dict:
     errors: list[str] = []
     for label, path in (("vector", request.vector), ("raster", request.raster)):
         if not path.is_file():
@@ -85,24 +86,27 @@ def _preflight(request: ZonalRequest) -> dict:
     if errors:
         raise ValueError("; ".join(errors))
     info = pyogrio.read_info(request.vector)
-    with rasterio.open(request.raster) as dataset:
-        if dataset.count < 1:
-            errors.append("classification raster has no bands")
-        _resolve_crs(dataset.crs, request.options.raster_crs_override, "raster")
-        raster = {
-            "width": dataset.width,
-            "height": dataset.height,
-            "dtype": dataset.dtypes[0],
-            "bounds": tuple(dataset.bounds),
-        }
+    if raster_metadata is None:
+        with rasterio.open(request.raster) as dataset:
+            if dataset.count < 1:
+                errors.append("classification raster has no bands")
+            _resolve_crs(dataset.crs, request.options.raster_crs_override, "raster")
+            raster = {
+                "width": dataset.width,
+                "height": dataset.height,
+                "dtype": dataset.dtypes[0],
+                "bounds": tuple(dataset.bounds),
+            }
+    else:
+        raster = raster_metadata
     _resolve_crs(info.get("crs"), request.options.vector_crs_override, "vector")
     if errors:
         raise ValueError("; ".join(errors))
     return {"features": int(info["features"]), "raster": raster}
 
 
-def plan(request: ZonalRequest) -> ExecutionPlan:
-    metadata = _preflight(request)
+def plan(request: ZonalRequest, *, raster_metadata: dict | None = None) -> ExecutionPlan:
+    metadata = _preflight(request, raster_metadata=raster_metadata)
     return ExecutionPlan(
         tool="zonal",
         inputs=(request.vector, request.raster),
@@ -117,12 +121,18 @@ def plan(request: ZonalRequest) -> ExecutionPlan:
     )
 
 
-def _detect_values(path: Path, nodata: int, context: RunContext) -> tuple[int, ...]:
+def detect_raster_values(path: Path, nodata: int, context: RunContext | None = None) -> tuple[int, ...]:
     values: set[int] = set()
     with rasterio.open(path) as dataset:
         for _, window in dataset.block_windows(1):
-            context.checkpoint()
-            values.update(int(value) for value in np.unique(dataset.read(1, window=window)) if int(value) != nodata)
+            if context is not None:
+                context.checkpoint()
+            block = dataset.read(1, window=window)
+            if block.dtype == np.uint8:
+                present = np.flatnonzero(np.bincount(block.ravel(), minlength=256))
+                values.update(int(v) for v in present if int(v) != nodata)
+            else:
+                values.update(int(v) for v in np.unique(block) if int(v) != nodata)
     return tuple(sorted(values))
 
 
@@ -203,7 +213,13 @@ def _failure_result(request, workspace, timings, memory, status, error) -> Zonal
     return ZonalResult(status, (), (error,), timings, memory.peak_mb, report, request.output_vector, 0, 0)
 
 
-def run(request: ZonalRequest, context: RunContext | None = None) -> ZonalResult:
+def run(
+    request: ZonalRequest,
+    context: RunContext | None = None,
+    *,
+    shared_executor: ProcessPoolExecutor | None = None,
+    predetected_values: tuple[int, ...] | None = None,
+) -> ZonalResult:
     started = time.perf_counter()
     timings: dict[str, float] = {}
     # This validation is deliberately before RunWorkspace.ensure(): invalid requests write nothing.
@@ -243,15 +259,24 @@ def run(request: ZonalRequest, context: RunContext | None = None) -> ZonalResult
         try:
             context.checkpoint()
             with StageTimer(timings, "load"):
-                values = request.options.valid_values or _detect_values(request.raster, request.options.nodata, context)
+                if request.options.valid_values:
+                    values = request.options.valid_values
+                elif predetected_values is not None:
+                    values = predetected_values
+                else:
+                    values = detect_raster_values(request.raster, request.options.nodata, context)
                 encoding = ClassEncoding.create(values) if values else None
                 fast_shapefile = request.vector.suffix.casefold() == ".shp"
+                with rasterio.open(request.raster) as dataset:
+                    raster_crs = _resolve_crs(dataset.crs, request.options.raster_crs_override, "raster")
+                    raster_bounds = tuple(dataset.bounds)
+                    raster_transform = dataset.transform
+                    raster_width = dataset.width
+                    raster_height = dataset.height
                 if fast_shapefile:
                     vector_info = pyogrio.read_info(request.vector)
                     feature_count = int(vector_info["features"])
                     vector_crs = _resolve_crs(vector_info.get("crs"), request.options.vector_crs_override, "vector")
-                    with rasterio.open(request.raster) as dataset:
-                        raster_crs = _resolve_crs(dataset.crs, request.options.raster_crs_override, "raster")
                     cached_bounds = read_envelope_index(request.vector)
                     spatial_index_cache_hit = cached_bounds is not None
                     source_bounds = cached_bounds if cached_bounds is not None else read_polygon_bounds(request.vector)
@@ -263,52 +288,66 @@ def run(request: ZonalRequest, context: RunContext | None = None) -> ZonalResult
                     feature_count = len(frame)
                     spatial_index_cache_hit = False
             with StageTimer(timings, "spatial_index"):
-                with rasterio.open(request.raster) as dataset:
-                    geometry_bounds = _geometry_bounds(geometries)
-                    intersection = (
-                        intersect_bounds(geometry_bounds, tuple(dataset.bounds))
-                        if geometry_bounds is not None
-                        else None
+                geometry_bounds = _geometry_bounds(geometries)
+                intersection = (
+                    intersect_bounds(geometry_bounds, raster_bounds)
+                    if geometry_bounds is not None
+                    else None
+                )
+                if intersection is None or encoding is None:
+                    jobs = []
+                elif fast_shapefile:
+                    jobs = plan_envelope_jobs(
+                        geometries,
+                        intersection,
+                        raster_transform,
+                        raster_width,
+                        raster_height,
+                        request.options.tile_size,
                     )
-                    if intersection is None or encoding is None:
-                        jobs = []
-                    elif fast_shapefile:
-                        jobs = plan_envelope_jobs(
-                            geometries,
-                            intersection,
-                            dataset.transform,
-                            dataset.width,
-                            dataset.height,
-                            request.options.tile_size,
-                        )
-                    else:
-                        jobs = plan_window_jobs(
-                            geometries,
-                            intersection,
-                            dataset.transform,
-                            dataset.width,
-                            dataset.height,
-                            request.options.tile_size,
-                        )
+                else:
+                    jobs = plan_window_jobs(
+                        geometries,
+                        intersection,
+                        raster_transform,
+                        raster_width,
+                        raster_height,
+                        request.options.tile_size,
+                    )
             candidate_queries = sum(job.candidates.size for job in jobs)
             scheduler = ResourceScheduler(context.resources)
             bytes_per_worker = request.options.tile_size**2 * 16
             requested = request.options.workers or context.resources.raster_workers
-            budget = context.resources
             if requested is not None:
-                from dataclasses import replace
-
-                scheduler = ResourceScheduler(replace(budget, raster_workers=requested))
+                scheduler = ResourceScheduler(replace(context.resources, raster_workers=requested))
             workers = scheduler.zonal_workers(max(1, len(jobs)), bytes_per_worker)
             counts = np.zeros((feature_count, len(values)), dtype=np.int64)
             completed = 0
             with StageTimer(timings, "count"):
-                batches = balanced_batches(jobs, workers) if jobs else []
-                executor_class = ProcessPoolExecutor if fast_shapefile else ThreadPoolExecutor
-                with executor_class(max_workers=workers) as executor:
-                    if fast_shapefile:
+                nonempty_jobs = [job for job in jobs if job.candidates.size]
+                batches = balanced_batches(nonempty_jobs, workers) if nonempty_jobs else []
+                if batches:
+                    if fast_shapefile and (len(batches) == 1 or workers == 1):
+                        # Avoid ~2s Windows process-spawn overhead for single-batch Shapefiles.
+                        positions, local, window_count = _process_shapefile_batch(
+                            request,
+                            batches[0],
+                            encoding,
+                            vector_crs,
+                            raster_crs,
+                        )
+                        counts[positions] += local
+                        completed += window_count
+                        context.emit(
+                            "progress",
+                            "count",
+                            f"Counted {completed}/{len(nonempty_jobs)} raster windows",
+                            completed=completed,
+                            total=len(nonempty_jobs),
+                        )
+                    elif fast_shapefile and shared_executor is not None:
                         futures = [
-                            executor.submit(
+                            shared_executor.submit(
                                 _process_shapefile_batch,
                                 request,
                                 batch,
@@ -318,26 +357,52 @@ def run(request: ZonalRequest, context: RunContext | None = None) -> ZonalResult
                             )
                             for batch in batches
                         ]
-                    else:
-                        futures = [
-                            executor.submit(_process_batch, request, geometries, batch, encoding, context)
-                            for batch in batches
-                        ]
-                    for future in as_completed(futures):
-                        if fast_shapefile:
+                        for future in as_completed(futures):
                             positions, local, window_count = future.result()
                             counts[positions] += local
-                        else:
-                            local, window_count = future.result()
-                            counts += local
-                        completed += window_count
-                        context.emit(
-                            "progress",
-                            "count",
-                            f"Counted {completed}/{len(jobs)} raster windows",
-                            completed=completed,
-                            total=len(jobs),
-                        )
+                            completed += window_count
+                            context.emit(
+                                "progress",
+                                "count",
+                                f"Counted {completed}/{len(nonempty_jobs)} raster windows",
+                                completed=completed,
+                                total=len(nonempty_jobs),
+                            )
+                    else:
+                        executor_class = ProcessPoolExecutor if fast_shapefile else ThreadPoolExecutor
+                        with executor_class(max_workers=min(workers, len(batches))) as executor:
+                            if fast_shapefile:
+                                futures = [
+                                    executor.submit(
+                                        _process_shapefile_batch,
+                                        request,
+                                        batch,
+                                        encoding,
+                                        vector_crs,
+                                        raster_crs,
+                                    )
+                                    for batch in batches
+                                ]
+                            else:
+                                futures = [
+                                    executor.submit(_process_batch, request, geometries, batch, encoding, context)
+                                    for batch in batches
+                                ]
+                            for future in as_completed(futures):
+                                if fast_shapefile:
+                                    positions, local, window_count = future.result()
+                                    counts[positions] += local
+                                else:
+                                    local, window_count = future.result()
+                                    counts += local
+                                completed += window_count
+                                context.emit(
+                                    "progress",
+                                    "count",
+                                    f"Counted {completed}/{len(nonempty_jobs)} raster windows",
+                                    completed=completed,
+                                    total=len(nonempty_jobs),
+                                )
             context.checkpoint()
             with StageTimer(timings, "write"):
                 combined_values, combined_counts = merge_counts(
@@ -412,11 +477,15 @@ def run(request: ZonalRequest, context: RunContext | None = None) -> ZonalResult
                 features_with_statistics=int(np.count_nonzero(combined_counts.sum(axis=1))),
                 output_fingerprint=dataset_fingerprint(request.output_vector),
             )
+            cleanup_warnings = workspace.cleanup_heavy()
+            if context.cleanup_on_success:
+                report, purge_warnings = workspace.purge_after_success(report)
+                cleanup_warnings = (*cleanup_warnings, *purge_warnings)
             context.emit("completed", "zonal", "Zonal assignment completed", output=str(request.output_vector))
             return ZonalResult(
                 TaskStatus.SUCCEEDED,
                 (Artifact("primary_vector", request.output_vector), Artifact("run_report", report)),
-                (),
+                cleanup_warnings,
                 timings,
                 memory.peak_mb,
                 report,

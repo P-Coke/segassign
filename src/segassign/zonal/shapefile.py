@@ -17,7 +17,7 @@ import shapely
 from pyproj import CRS, Transformer
 
 INDEX_VERSION = 1
-INTERNAL_OUTPUT_FIELDS = frozenset({"tile_id", "source_fid", "gap_fill"})
+INTERNAL_OUTPUT_FIELDS = frozenset({"tile_id", "source_fid", "gap_fill", "seam_band"})
 _ASSIGNMENT_FIELD = re.compile(r"^(?:class|v\d+p?)$", re.IGNORECASE)
 
 
@@ -178,7 +178,4 @@ def write_attributes_with_source_geometry(
         shutil.copy2(source_index, staged.with_suffix(".gtbidx"))
     for old in staged.parent.glob(scratch.stem + ".*"):
         old.unlink(missing_ok=True)
-    info = pyogrio.read_info(staged)
-    if int(info["features"]) != len(attributes):
-        raise RuntimeError("fast Shapefile staging changed feature count")
     return len(attributes)

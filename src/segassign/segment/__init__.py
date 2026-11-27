@@ -1,20 +1,6 @@
-"""Public segmentation API."""
+"""Public API for the segmentation backend."""
 
-from __future__ import annotations
+from .batch import plan_batch, run_batch
+from .service import plan, run
 
-from ..models import ExecutionPlan, SegmentRequest, SegmentResult
-
-
-def plan(request: SegmentRequest) -> ExecutionPlan:
-    from .service import plan as build_plan
-
-    return build_plan(request)
-
-
-def run(request: SegmentRequest, context=None) -> SegmentResult:
-    from .service import run as execute
-
-    return execute(request, context)
-
-
-__all__ = ["plan", "run"]
+__all__ = ["plan", "plan_batch", "run", "run_batch"]

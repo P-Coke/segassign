@@ -62,6 +62,7 @@ class RunContext:
     event_sink: EventSink | None = None
     resources: ResourceBudget = field(default_factory=ResourceBudget)
     resume: bool = False
+    cleanup_on_success: bool = False
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     _sequence: int = field(default=0, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)

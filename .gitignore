@@ -28,6 +28,8 @@ tests/temp/
 /sandbox/
 .geotoolbox-work/
 .geotoolbox-segment/
+SegAssign-Cache/
+.probe_tmp/
 /config/config.json
 /.prj
 

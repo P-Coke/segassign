@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from shapely.geometry import box
 
-from segassign.zonal.counting import ClassEncoding, bincount_window, statistic_row
+from segassign.zonal.counting import ClassEncoding, bincount_rows, statistics_frame_dense
 from segassign.zonal.shapefile import read_envelope_index, read_polygon_bounds, write_envelope_index
 from segassign.zonal.spatial import CandidateIndex
 
@@ -14,10 +14,11 @@ def test_bincount_matches_reference_for_nodata_and_missing_classes():
     candidates = np.array([7, 12], dtype=np.int64)
     encoding = ClassEncoding.create((3, 4, 8))
 
-    actual = bincount_window(pixels, labels, candidates, encoding, nodata=0)
+    counts = bincount_rows(pixels, labels, candidates, encoding, nodata=0)
 
-    assert actual == {7: {3: 2, 4: 1}, 12: {4: 1, 8: 2}}
-    assert statistic_row(actual[7], 3, 65) == {
+    np.testing.assert_array_equal(counts, np.array([[2, 1, 0], [0, 1, 2]], dtype=np.int64))
+    stats = statistics_frame_dense(counts, encoding.values, threshold=65)
+    assert stats.iloc[0].to_dict() == {
         "class": 3,
         "v1": 3,
         "v1p": 67,
@@ -26,6 +27,28 @@ def test_bincount_matches_reference_for_nodata_and_missing_classes():
         "v3": 0,
         "v3p": 0,
     }
+    assert stats.iloc[1].to_dict() == {
+        "class": 8,
+        "v1": 8,
+        "v1p": 67,
+        "v2": 4,
+        "v2p": 33,
+        "v3": 0,
+        "v3p": 0,
+    }
+
+
+def test_bincount_contiguous_path_handles_nodata_inside_and_outside_range():
+    pixels = np.array([[0, 1, 2, 2], [1, 2, 3, 3]], dtype=np.uint8)
+    labels = np.array([[1, 1, 1, 2], [1, 2, 2, 2]], dtype=np.int32)
+    candidates = np.array([0, 1], dtype=np.int64)
+    encoding = ClassEncoding.create((1, 2, 3))
+
+    counts = bincount_rows(pixels, labels, candidates, encoding, nodata=0)
+    np.testing.assert_array_equal(counts, np.array([[2, 1, 0], [0, 2, 2]], dtype=np.int64))
+
+    counts_skip_2 = bincount_rows(pixels, labels, candidates, encoding, nodata=2)
+    np.testing.assert_array_equal(counts_skip_2, np.array([[2, 0, 0], [0, 0, 2]], dtype=np.int64))
 
 
 def test_strtree_candidates_equal_brute_force_envelope_filter():

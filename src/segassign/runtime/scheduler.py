@@ -80,20 +80,22 @@ class ResourceScheduler:
         return int(psutil.virtual_memory().total * self.budget.memory_fraction)
 
     def zonal_workers(self, window_count: int, bytes_per_worker: int) -> int:
-        requested = self.budget.raster_workers or max(1, self.budget.logical_cpus // 2)
+        cpus = self.budget.logical_cpus
+        default_workers = max(1, min(12, cpus - 2 if cpus > 3 else cpus))
+        requested = self.budget.raster_workers or default_workers
         memory_cap = max(1, self.memory_limit_bytes // max(1, bytes_per_worker))
         return max(1, min(window_count, requested, memory_cap))
 
     def ecognition_workers(self, requested: int | None = None) -> int:
-        value = requested or self.budget.ecognition_workers or min(7, max(1, self.budget.logical_cpus // 2))
-        # Production calibration on the retained eCognition 9 adapter measured
-        # 4.25 GiB total at seven concurrent workers. Keep a wide per-worker
-        # safety allowance while allowing the measured optimum under the 80%
-        # physical-memory budget.
-        memory_cap = max(1, self.memory_limit_bytes // (int(2.5 * 1024**3)))
+        physical = psutil.cpu_count(logical=False) or max(1, self.budget.logical_cpus // 2)
+        default_workers = min(12, max(2, physical - 2) if physical >= 6 else max(1, physical))
+        value = requested or self.budget.ecognition_workers or default_workers
+        # Calibrated eCognition 9 usage is ~0.65 GiB per worker (8.1 GiB at 12
+        # workers); keep a 1.3 GiB safety allowance per worker.
+        memory_cap = max(1, self.memory_limit_bytes // int(1.3 * 1024**3))
         return max(1, min(value, memory_cap, self.budget.logical_cpus))
 
     def postprocess_workers(self, requested: int | None = None) -> int:
-        value = requested or max(1, min(4, self.budget.logical_cpus // 3))
-        memory_cap = max(1, self.memory_limit_bytes // (1024**3))
+        value = requested or max(1, min(8, self.budget.logical_cpus // 2))
+        memory_cap = max(1, self.memory_limit_bytes // (768 * 1024**2))
         return max(1, min(value, memory_cap))
