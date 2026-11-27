@@ -1,4 +1,4 @@
-# SegAssign 2.2.0
+# SegAssign 2.2.1
 
 遥感科研项目配套自动化工具的全新导航式向导与高吞吐尾段并行调度版本。
 
@@ -15,7 +15,7 @@
 
 ## 使用说明
 
-Windows 用户请完整解压 `SegAssign-v2.2.0-Windows-x64.zip` 并运行 `SegAssign.exe`，保留 `_internal` 目录。`00/01` 分割要求本机安装并授权 eCognition Developer 9（程序将自动侦测，也支持手动选择安装根目录或 `bin`）；`02` 赋值无需该软件。
+Windows 用户请完整解压 `SegAssign-v2.2.1-Windows-x64.zip` 并运行 `SegAssign.exe`，保留 `_internal` 目录。`00/01` 分割要求本机安装并授权 eCognition Developer 9（程序将自动侦测，也支持手动选择安装根目录或 `bin`）；`02` 赋值无需该软件。
 
 ## 验证摘要
 

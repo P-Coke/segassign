@@ -51,7 +51,7 @@ mamba run -n Geo-Workspace python benchmarks/run_micro.py --repeats 5 --enforce
 构建 Windows 便携包：
 
 ```powershell
-.\packaging\build_release.ps1 -Version 2.2.0
+.\packaging\build_release.ps1 -Version 2.2.1
 ```
 
 ## 项目结构

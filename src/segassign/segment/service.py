@@ -507,7 +507,7 @@ class SharedEnginePool:
         target_pct = min(95.0, max(50.0, context.resources.memory_fraction * 100.0))
         self.tuner = DynamicAutoTuner(
             initial_workers=self.initial_workers,
-            min_workers=max(1, min(2, self.initial_workers)),
+            min_workers=max(1, min(self.initial_workers, max(4, self.initial_workers // 2))),
             max_workers=self.max_workers,
             target_cpu_pct=target_pct,
             target_ram_pct=target_pct,
@@ -766,7 +766,7 @@ def _run_engine_stage(
             target_pct = min(95.0, max(50.0, context.resources.memory_fraction * 100.0))
             tuner = DynamicAutoTuner(
                 initial_workers=engine_workers,
-                min_workers=max(1, min(2, engine_workers)),
+                min_workers=max(1, min(engine_workers, max(4, engine_workers // 2))),
                 max_workers=engine_max_workers,
                 target_cpu_pct=target_pct,
                 target_ram_pct=target_pct,
@@ -836,7 +836,7 @@ def _run_engine_stage(
             owned_pool: ThreadPoolExecutor | None = (
                 None
                 if shared_pool is not None
-                else ThreadPoolExecutor(max_workers=tuner.max_workers, thread_name_prefix="ecognition")
+                else ThreadPoolExecutor(max_workers=engine_workers, thread_name_prefix="ecognition")
             )
             try:
 
@@ -878,13 +878,9 @@ def _run_engine_stage(
                             context=context,
                         )
                     else:
-                        # Dynamically gate in-flight eCognition concurrency to track ~90% CPU/RAM safely.
-                        active_limit = tuner.recommended_concurrency()
-                        while len(engine_futures) >= active_limit:
-                            context.checkpoint()
-                            completed, _ = wait(engine_futures, return_when=FIRST_COMPLETED)
-                            collect_engine(completed)
-                            active_limit = tuner.recommended_concurrency()
+                        # Never block inside the row-prepare loop while row_data (~1.3 GB) is in RAM;
+                        # owned_pool bounds concurrent execution cleanly, and between-row backpressure
+                        # keeps a 1-row lookahead buffer ready so workers never starve between rows.
                         assert owned_pool is not None
                         future = owned_pool.submit(run_tile, tile_root / tile.tile_id, sandbox_root, request, context)
                     engine_futures[future] = tile
@@ -896,13 +892,16 @@ def _run_engine_stage(
                     active_limit = (
                         shared_pool.active_limit() if shared_pool is not None else tuner.recommended_concurrency()
                     )
-                    while len(engine_futures) >= active_limit + 2:
+                    # Keep ~1.5x active_limit queued so eCognition workers never sit idle during row reads.
+                    queue_ceiling = max(active_limit + 4, int(active_limit * 1.5))
+                    while len(engine_futures) >= queue_ceiling:
                         context.checkpoint()
                         completed, _ = wait(engine_futures, return_when=FIRST_COMPLETED)
                         collect_engine(completed)
                         active_limit = (
                             shared_pool.active_limit() if shared_pool is not None else tuner.recommended_concurrency()
                         )
+                        queue_ceiling = max(active_limit + 4, int(active_limit * 1.5))
 
                 def _prepare_one(tile: Tile, tile_data, process_ds, base_ds, base_rdr):
                     context.checkpoint()

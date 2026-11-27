@@ -49,7 +49,7 @@ def test_build_resource_budget_scales_aggressively_to_90pct_and_guards_tight_ram
         physical_cores=14,
         logical_cpus=20,
         total_memory_gb=24.0,
-        available_memory_gb=16.0,
+        available_memory_gb=9.2,
         recommended_cache_dir=Path("D:/SegAssign-Cache"),
         cache_drive_label="D: (NVMe)",
     )
@@ -59,10 +59,12 @@ def test_build_resource_budget_scales_aggressively_to_90pct_and_guards_tight_ram
 
     assert low.ecognition_workers < auto.ecognition_workers <= high.ecognition_workers
     assert auto.memory_fraction == 0.90
-    assert auto.ecognition_workers >= 14
+    # Even with Windows standby cache lowering reported available RAM to 9.2 GB on a 24 GB host,
+    # auto must still launch near 90% logical threads (18) instead of starving at 7-11.
+    assert auto.ecognition_workers == 18
     assert auto.raster_workers == 18
-    assert high.memory_fraction == 0.92
-    assert high.ecognition_workers >= auto.ecognition_workers
+    assert high.memory_fraction == 0.95
+    assert high.ecognition_workers == 20
 
     tight_ram = HardwareProfile(
         physical_cores=16,
@@ -73,48 +75,50 @@ def test_build_resource_budget_scales_aggressively_to_90pct_and_guards_tight_ram
         cache_drive_label="D: (NVMe)",
     )
     auto_tight = build_resource_budget(tight_ram, "auto")
-    assert auto_tight.ecognition_workers <= 6
+    assert auto_tight.ecognition_workers <= 7
 
 
-def test_dynamic_auto_tuner_ramps_up_toward_90pct_and_throttles_on_ram_pressure(monkeypatch):
+def test_dynamic_auto_tuner_ignores_high_cpu_and_uses_hysteresis_on_ram_pressure(monkeypatch):
     now = [0.0]
     readings = iter(
         [
-            (60.0, 68.0),  # plenty of headroom -> +1
-            (72.0, 75.0),  # still below 86% RAM / 87% CPU -> +1
-            (85.0, 91.0),  # RAM >= 90% -> -1
-            (88.0, 94.0),  # RAM >= 93% -> -2
+            (99.0, 82.0),  # 99% CPU + 82% RAM -> must NOT throttle; ramps UP (+1)
+            (98.0, 94.0),  # single RAM spike >= 93% -> streak=1, do NOT drop yet
+            (98.0, 94.5),  # sustained RAM >= 93% (streak=2) -> step down (-1)
+            (98.0, 95.0),  # within 20s cooldown -> must NOT death-spiral
+            (95.0, 84.0),  # RAM recovered <= 87% -> ramp back UP (+1)
         ]
     )
     tuner = DynamicAutoTuner(
-        initial_workers=8,
-        min_workers=4,
-        max_workers=16,
+        initial_workers=16,
+        min_workers=8,
+        max_workers=18,
         target_cpu_pct=90.0,
         target_ram_pct=90.0,
-        sample_interval=2.0,
+        sample_interval=3.0,
+        step_down_cooldown=20.0,
+        step_up_cooldown=8.0,
         clock=lambda: now[0],
         sampler=lambda: next(readings),
     )
 
-    # Before sample_interval, returns cached concurrency without sampling.
-    assert tuner.recommended_concurrency() == 8
-    now[0] += 2.5
-    assert tuner.recommended_concurrency() == 9
-    now[0] += 2.5
-    assert tuner.recommended_concurrency() == 10
-    now[0] += 2.5
-    assert tuner.recommended_concurrency() == 9
-    now[0] += 2.5
-    assert tuner.recommended_concurrency() == 7
-    assert tuner.adjustments == 4
-    assert tuner.peak_workers == 10
+    assert tuner.recommended_concurrency() == 16
+    now[0] += 4.0
+    assert tuner.recommended_concurrency() == 17  # 99% CPU did NOT throttle!
+    now[0] += 4.0
+    assert tuner.recommended_concurrency() == 17  # single RAM spike ignored
+    now[0] += 4.0
+    assert tuner.recommended_concurrency() == 16  # sustained RAM -> -1
+    now[0] += 4.0
+    assert tuner.recommended_concurrency() == 16  # protected by 20s cooldown
+    now[0] += 10.0
+    assert tuner.recommended_concurrency() == 17  # recovered cleanly
 
     monkeypatch.delenv("GDAL_CACHEMAX", raising=False)
     cache_mb = configure_gdal_cache(
         HardwareProfile(14, 20, 24.0, 16.0, Path("D:/SegAssign-Cache"), "D: (NVMe)")
     )
-    assert 1024 <= cache_mb <= 2048
+    assert cache_mb == 512
 
 
 def test_adapt_tile_size_shrinks_medium_rasters_and_keeps_3072_for_full_scenes():

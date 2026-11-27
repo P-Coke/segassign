@@ -89,25 +89,23 @@ class ResourceScheduler:
     def ecognition_workers(self, requested: int | None = None) -> int:
         cpus = self.budget.logical_cpus
         physical = psutil.cpu_count(logical=False) or max(1, cpus // 2)
-        default_workers = min(32, max(physical, round(cpus * 0.85)))
+        default_workers = min(32, max(physical, round(cpus * 0.90)))
         if cpus > 2:
             default_workers = min(default_workers, cpus - 1)
         value = requested or self.budget.ecognition_workers or default_workers
-        # Calibrated eCognition 9 usage is ~0.65 GiB per worker; use 0.78 GiB
-        # safety allowance so 90% RAM budget scales aggressively without OOM.
-        memory_cap = max(1, self.memory_limit_bytes // int(0.78 * 1024**3))
+        # Calibrated eCognition 9 usage is ~0.65 GiB per worker.
+        memory_cap = max(2, self.memory_limit_bytes // int(0.68 * 1024**3))
         return max(1, min(value, memory_cap, cpus))
 
     def ecognition_max_workers(self, requested: int | None = None) -> int:
-        """Upper ceiling for dynamic concurrency ramp-up when live RAM/CPU allow."""
+        """Upper ceiling for dynamic concurrency ramp-up bounded by mode fraction and RAM."""
+        base = self.ecognition_workers(requested)
         if requested is not None:
-            return self.ecognition_workers(requested)
+            return base
         cpus = self.budget.logical_cpus
-        cpu_cap = max(1, min(32, round(cpus * 0.90)))
-        if cpus > 2:
-            cpu_cap = min(cpu_cap, cpus - 1)
-        memory_cap = max(1, self.memory_limit_bytes // int(0.72 * 1024**3))
-        return max(self.ecognition_workers(), min(cpu_cap, memory_cap))
+        mode_cap = max(base, min(32, round(cpus * min(1.0, self.budget.memory_fraction + 0.05))))
+        memory_cap = max(2, self.memory_limit_bytes // int(0.65 * 1024**3))
+        return max(base, min(mode_cap, memory_cap))
 
     def postprocess_workers(self, requested: int | None = None) -> int:
         cpus = self.budget.logical_cpus
@@ -116,10 +114,12 @@ class ResourceScheduler:
         return max(1, min(value, memory_cap))
 
     def prepare_workers(self) -> int:
-        return max(2, min(8, round(self.budget.logical_cpus * 0.40)))
+        # 4 threads saturate USB/NVMe I/O without fighting eCognition for CPU cores.
+        return max(2, min(4, self.budget.logical_cpus // 4 or 2))
 
     def background_postprocess_workers(self) -> int:
-        return max(1, min(6, self.postprocess_workers() // 3))
+        # 2 lean workers process ~4 tiles/sec (~10x eCognition rate) while saving >1 GB RAM for eCognition.
+        return 2 if self.budget.logical_cpus >= 6 else 1
 
     def background_zonal_workers(self) -> int:
-        return max(2, min(8, round(self.budget.logical_cpus * 0.40)))
+        return max(2, min(6, round(self.budget.logical_cpus * 0.30)))

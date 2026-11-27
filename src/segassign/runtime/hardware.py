@@ -192,7 +192,7 @@ def detect_hardware() -> HardwareProfile:
 
 
 def configure_gdal_cache(profile: HardwareProfile | None = None) -> int:
-    """Tune GDAL_CACHEMAX to ~8% of total RAM (256-2048 MB) unless explicitly set."""
+    """Tune GDAL_CACHEMAX to a lean 256-512 MB so sequential row reads never starve eCognition RAM."""
     existing = os.environ.get("GDAL_CACHEMAX", "").strip()
     if existing:
         try:
@@ -200,64 +200,56 @@ def configure_gdal_cache(profile: HardwareProfile | None = None) -> int:
         except ValueError:
             return 0
     total_gb = profile.total_memory_gb if profile is not None else psutil.virtual_memory().total / 1024**3
-    cache_mb = max(256, min(2048, int(round(total_gb * 1024 * 0.08))))
+    cache_mb = 512 if total_gb >= 16.0 else 256
     os.environ["GDAL_CACHEMAX"] = str(cache_mb)
     return cache_mb
 
 
 def build_resource_budget(profile: HardwareProfile, mode: str = "auto") -> ResourceBudget:
-    """Translate hardware profile + performance mode into aggressive, RAM-guarded worker limits."""
+    """Translate hardware profile + performance mode into high-throughput worker limits.
+
+    Uses total physical RAM (not volatile Windows standby-compressed available RAM) as the primary
+    sizing basis, while keeping a tight-RAM guardrail for small-memory machines (<= 16 GB with heavy
+    pre-existing usage).
+    """
     phys = profile.physical_cores
     logical = profile.logical_cpus
 
     if mode == "low":
-        eco = max(2, min(6, phys // 2 or 1))
-        raster = max(2, min(6, max(1, round(logical * 0.40))))
+        eco = max(2, min(8, phys // 2 or 1))
+        raster = max(2, min(8, max(1, round(logical * 0.45))))
         return ResourceBudget(
             logical_cpus=max(1, round(logical * 0.50)),
-            memory_fraction=0.55,
+            memory_fraction=0.60,
             ecognition_workers=eco,
             raster_workers=raster,
         )
 
     if mode == "high":
-        # Push up to ~95% CPU and ~92% total RAM while retaining an 8% OS floor.
-        safe_headroom_gb = max(
-            1.5,
-            min(
-                profile.total_memory_gb * 0.92,
-                profile.available_memory_gb - profile.total_memory_gb * 0.08 + 2.0,
-            ),
-        )
-        mem_cap = max(1, int(safe_headroom_gb / 0.68))
-        cpu_cap = max(1, logical - 1 if logical > 2 else logical)
-        eco_target = min(32, cpu_cap, max(phys + 2, round(logical * 0.90)))
-        eco = max(1, min(eco_target, mem_cap))
-        raster = max(1, min(32, cpu_cap))
+        # Maximum throughput: saturate up to 100% logical threads bounded only by total RAM (~95%).
+        mem_cap = max(2, int((profile.total_memory_gb * 0.95) / 0.65))
+        eco = max(2, min(32, logical, mem_cap))
+        raster = max(2, min(32, logical))
         return ResourceBudget(
             logical_cpus=logical,
-            memory_fraction=0.92,
+            memory_fraction=0.95,
             ecognition_workers=eco,
             raster_workers=raster,
         )
 
-    # Default "auto" (自动极速 · 动态 90% 调优): target ~90% CPU and ~90% total RAM.
-    # Calibrated eCognition 9 usage is ~0.65 GiB/worker; 0.78 GiB/worker preserves burst headroom.
-    reserve_gb = profile.total_memory_gb * 0.10
-    safe_headroom_gb = max(
-        1.6,
-        min(
-            profile.total_memory_gb * 0.90,
-            profile.available_memory_gb - reserve_gb + min(2.0, profile.total_memory_gb * 0.08),
-        ),
-    )
-    mem_cap = max(1, int(safe_headroom_gb / 0.78))
-    cpu_90 = max(1, min(32, round(logical * 0.90)))
-    eco_target = min(cpu_90, max(phys, round(logical * 0.85)))
+    # Default "auto" (自动极速 · 90% 满载): immediately launch at ~90% logical threads without being
+    # crippled by Windows standby file cache; only scale back on genuinely low-memory hosts.
+    usable_gb = profile.total_memory_gb * 0.88
+    if profile.available_memory_gb < min(6.0, profile.total_memory_gb * 0.30):
+        # Genuinely tight RAM (e.g. 8-16 GB host with < 4-6 GB free): avoid swap thrashing.
+        usable_gb = max(2.5, profile.available_memory_gb * 1.15)
+    mem_cap = max(2, int(usable_gb / 0.68))
+    cpu_90 = max(2, min(32, round(logical * 0.90)))
+    eco_target = max(phys, cpu_90)
     if logical > 2:
         eco_target = min(eco_target, logical - 1)
-    eco = max(1, min(eco_target, mem_cap))
-    raster = max(1, min(32, cpu_90))
+    eco = max(2, min(32, eco_target, mem_cap))
+    raster = max(2, min(32, cpu_90))
     return ResourceBudget(
         logical_cpus=logical,
         memory_fraction=0.90,
@@ -267,7 +259,14 @@ def build_resource_budget(profile: HardwareProfile, mode: str = "auto") -> Resou
 
 
 class DynamicAutoTuner:
-    """Low-overhead runtime concurrency controller targeting ~90% CPU & RAM safely."""
+    """Hysteresis-guarded concurrency controller that sustains ~90% throughput without death-spiraling.
+
+    Key invariants:
+      - NEVER throttles on high CPU (95-100% CPU is the target state, not an error).
+      - Only steps down on SUSTAINED critical RAM pressure (>= hard_ram_pct for 2 consecutive checks)
+        with a 20s cooldown so exiting eCognition processes have time to actually free RAM.
+      - Enforces a high floor (at least 50% of initial workers) so concurrency can never collapse.
+    """
 
     def __init__(
         self,
@@ -277,7 +276,9 @@ class DynamicAutoTuner:
         max_workers: int,
         target_cpu_pct: float = 90.0,
         target_ram_pct: float = 90.0,
-        sample_interval: float = 2.0,
+        sample_interval: float = 3.0,
+        step_down_cooldown: float = 20.0,
+        step_up_cooldown: float = 8.0,
         clock: Callable[[], float] = time.monotonic,
         sampler: Callable[[], tuple[float, float]] | None = None,
     ) -> None:
@@ -286,20 +287,25 @@ class DynamicAutoTuner:
         self.current_workers = max(self.min_workers, min(self.max_workers, int(initial_workers)))
         self.target_cpu_pct = float(target_cpu_pct)
         self.target_ram_pct = float(target_ram_pct)
+        self.hard_ram_pct = min(97.0, max(self.target_ram_pct + 3.0, 93.0))
         self.sample_interval = max(0.5, float(sample_interval))
+        self.step_down_cooldown = max(0.0, float(step_down_cooldown))
+        self.step_up_cooldown = max(0.0, float(step_up_cooldown))
         self._clock = clock
         self._sampler = sampler or self._default_sample
-        self._last_sample_at = self._clock()
+        now = self._clock()
+        self._last_sample_at = now
+        self._last_down_at = now - self.step_down_cooldown
+        self._last_up_at = now - self.step_up_cooldown
+        self._high_ram_streak = 0
         self.adjustments = 0
         self.peak_workers = self.current_workers
         self.min_observed_workers = self.current_workers
-        if sampler is None:
-            # Prime psutil's non-blocking CPU counter once.
-            psutil.cpu_percent(interval=None)
 
     @staticmethod
     def _default_sample() -> tuple[float, float]:
-        return float(psutil.cpu_percent(interval=None)), float(psutil.virtual_memory().percent)
+        # Only read virtual_memory (thread-safe, O(1), never races UI's cpu_percent counter).
+        return 0.0, float(psutil.virtual_memory().percent)
 
     def recommended_concurrency(self) -> int:
         now = self._clock()
@@ -307,18 +313,22 @@ class DynamicAutoTuner:
             return self.current_workers
         self._last_sample_at = now
         try:
-            cpu_pct, ram_pct = self._sampler()
+            _cpu_pct, ram_pct = self._sampler()
         except Exception:
             return self.current_workers
 
         previous = self.current_workers
-        if ram_pct >= self.target_ram_pct:
-            step = 2 if ram_pct >= self.target_ram_pct + 3.0 else 1
-            self.current_workers = max(self.min_workers, self.current_workers - step)
-        elif cpu_pct >= min(98.5, self.target_cpu_pct + 6.0) and ram_pct >= self.target_ram_pct - 5.0:
-            self.current_workers = max(self.min_workers, self.current_workers - 1)
-        elif ram_pct <= self.target_ram_pct - 4.0 and cpu_pct <= self.target_cpu_pct - 3.0:
-            self.current_workers = min(self.max_workers, self.current_workers + 1)
+        if ram_pct >= self.hard_ram_pct:
+            self._high_ram_streak += 1
+            if self._high_ram_streak >= 2 and (now - self._last_down_at) >= self.step_down_cooldown:
+                self.current_workers = max(self.min_workers, self.current_workers - 1)
+                self._last_down_at = now
+                self._high_ram_streak = 0
+        else:
+            self._high_ram_streak = 0
+            if ram_pct <= self.target_ram_pct - 3.0 and (now - self._last_up_at) >= self.step_up_cooldown:
+                self.current_workers = min(self.max_workers, self.current_workers + 1)
+                self._last_up_at = now
 
         if self.current_workers != previous:
             self.adjustments += 1
@@ -330,6 +340,7 @@ class DynamicAutoTuner:
         return {
             "target_cpu_pct": self.target_cpu_pct,
             "target_ram_pct": self.target_ram_pct,
+            "hard_ram_pct": self.hard_ram_pct,
             "max_workers": self.max_workers,
             "peak_workers": self.peak_workers,
             "min_observed_workers": self.min_observed_workers,
