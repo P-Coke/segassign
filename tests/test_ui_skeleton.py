@@ -108,7 +108,8 @@ def test_zonal_ui_uses_file_or_directory_input_and_hidden_work_directory(monkeyp
     assert set(page.fields) == {"vector_source", "classification", "output_directory"}
     assert page.fields["vector_source"].mode == "file-or-directory"
     assert "work" not in page.fields
-    assert window.run_button.text() == "开始批量赋值"
+    assert window.wizard_stack.currentIndex() == 0
+    assert window.next_to_confirm_button.text().startswith("下一步")
     assert window.performance_modes["auto"].isChecked()
     assert window.auto_cleanup.isChecked()
     window.close()

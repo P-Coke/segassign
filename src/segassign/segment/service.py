@@ -22,6 +22,7 @@ from rasterio.warp import transform_bounds
 from ..models import Artifact, ExecutionPlan, SegmentRequest, SegmentResult, TaskStatus
 from ..runtime import (
     CancelledError,
+    DynamicAutoTuner,
     EngineLease,
     PeakMemoryTracker,
     ResourceScheduler,
@@ -29,6 +30,7 @@ from ..runtime import (
     RunWorkspace,
     StageTimer,
     adapt_tile_size,
+    configure_gdal_cache,
 )
 from ..runtime.workspace import (
     atomic_json,
@@ -169,6 +171,22 @@ def _preflight(request: SegmentRequest) -> dict:
 
 def plan(request: SegmentRequest) -> ExecutionPlan:
     metadata = _preflight(request)
+    metadata["items"] = 1
+    metadata["items_preview"] = (
+        {
+            "item_id": str(request.process_raster),
+            "name": request.process_raster.name,
+            "relative_path": request.process_raster.name,
+            "output": str(request.output_vector),
+            "output_name": request.output_vector.name,
+            "size_summary": (
+                f"{metadata['width']}×{metadata['height']} · {metadata['bands']}波段 · {metadata['tiles']}块"
+            ),
+            "auxiliary": f"基础：{request.base_raster.name}",
+            "match_mode": "单景直连",
+            "tiles_total": int(metadata["tiles"]),
+        },
+    )
     return ExecutionPlan(
         "segment",
         (request.process_raster, request.base_raster, request.ruleset),
@@ -478,6 +496,68 @@ def _report_failure(
     )
 
 
+class SharedEnginePool:
+    """Shared eCognition worker pool with one global DynamicAutoTuner across overlapping batch scenes."""
+
+    def __init__(self, context: RunContext, requested_workers: int | None = None) -> None:
+        configure_gdal_cache()
+        scheduler = ResourceScheduler(context.resources)
+        self.initial_workers = scheduler.ecognition_workers(requested_workers)
+        self.max_workers = scheduler.ecognition_max_workers(requested_workers)
+        target_pct = min(95.0, max(50.0, context.resources.memory_fraction * 100.0))
+        self.tuner = DynamicAutoTuner(
+            initial_workers=self.initial_workers,
+            min_workers=max(1, min(2, self.initial_workers)),
+            max_workers=self.max_workers,
+            target_cpu_pct=target_pct,
+            target_ram_pct=target_pct,
+        )
+        self._pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="ecognition")
+        self._cond = threading.Condition()
+        self._active = 0
+
+    def __enter__(self) -> SharedEnginePool:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._pool.shutdown(wait=True)
+
+    @property
+    def active_count(self) -> int:
+        with self._cond:
+            return self._active
+
+    def active_limit(self) -> int:
+        return self.tuner.recommended_concurrency()
+
+    def spare_capacity(self) -> int:
+        limit = self.tuner.recommended_concurrency()
+        with self._cond:
+            return max(0, limit - self._active)
+
+    def submit(self, fn: Callable, *args, context: RunContext) -> object:
+        with self._cond:
+            while self._active >= self.tuner.recommended_concurrency():
+                context.checkpoint()
+                self._cond.wait(timeout=0.25)
+            self._active += 1
+        try:
+            future = self._pool.submit(fn, *args)
+        except Exception:
+            with self._cond:
+                self._active = max(0, self._active - 1)
+                self._cond.notify_all()
+            raise
+
+        def _release(_future) -> None:
+            with self._cond:
+                self._active = max(0, self._active - 1)
+                self._cond.notify_all()
+
+        future.add_done_callback(_release)
+        return future
+
+
 def prefetch_first_row(request: SegmentRequest, context: RunContext) -> PrefetchedRow | None:
     """Pre-prepare Row 0 of the next scene during the current scene's engine tail."""
     try:
@@ -584,9 +664,22 @@ def _run_engine_stage(
     hold_lease: bool = True,
     prefetched: PrefetchedRow | None = None,
     on_prepare_complete: Callable[[], None] | None = None,
+    shared_pool: SharedEnginePool | None = None,
+    on_tail_ready: Callable[[], None] | None = None,
 ) -> _StagedSegment | SegmentResult:
     started = time.perf_counter()
     timings: dict[str, float] = {}
+    tail_notified = False
+
+    def notify_tail_ready() -> None:
+        nonlocal tail_notified
+        if not tail_notified and on_tail_ready is not None:
+            tail_notified = True
+            try:
+                on_tail_ready()
+            except Exception:
+                pass
+
     execution_plan = plan(request)  # must precede every workspace write
     context = context or RunContext(request.output_vector.parent / ".geotoolbox-work")
     run_fingerprint = _run_fingerprint(request)
@@ -601,6 +694,7 @@ def _run_engine_stage(
         and Path(complete.get("report", "")).is_file()
     ):
         report = Path(complete["report"])
+        notify_tail_ready()
         return SegmentResult(
             TaskStatus.SUCCEEDED,
             (Artifact("primary_vector", request.output_vector), Artifact("run_report", report)),
@@ -644,10 +738,39 @@ def _run_engine_stage(
                     request.options.buffer_pixels,
                 )
                 raster_shape = (process.width, process.height, process.transform, process_crs)
+                context.emit(
+                    "grid",
+                    "tile-map",
+                    f"已生成 {len(tiles)} 块切片网格",
+                    width=process.width,
+                    height=process.height,
+                    crs=str(process_crs),
+                    bounds=[float(v) for v in process.bounds],
+                    tiles=[
+                        (
+                            t.tile_id,
+                            int(t.core.col_off),
+                            int(t.core.row_off),
+                            int(t.core.width),
+                            int(t.core.height),
+                        )
+                        for t in tiles
+                    ],
+                )
+            configure_gdal_cache()
             scheduler = ResourceScheduler(context.resources)
             engine_workers = scheduler.ecognition_workers(request.options.ecognition_workers)
+            engine_max_workers = scheduler.ecognition_max_workers(request.options.ecognition_workers)
             post_workers = scheduler.postprocess_workers(request.options.postprocess_workers)
-            prepare_workers = min(4, max(2, engine_workers // 2))
+            prepare_workers = scheduler.prepare_workers()
+            target_pct = min(95.0, max(50.0, context.resources.memory_fraction * 100.0))
+            tuner = DynamicAutoTuner(
+                initial_workers=engine_workers,
+                min_workers=max(1, min(2, engine_workers)),
+                max_workers=engine_max_workers,
+                target_cpu_pct=target_pct,
+                target_ram_pct=target_pct,
+            )
             runnable: list[Tile] = []
             skipped: list[Tile] = []
             engine_resumed = 0
@@ -657,7 +780,7 @@ def _run_engine_stage(
             # Pipeline postprocessing alongside eCognition for larger grids so
             # postprocessing finishes on spare CPU cores before the last tile ends.
             overlap_postprocess = len(tiles) > 4 and _run_postprocess is _REAL_RUN_POSTPROCESS
-            bg_post_workers = min(3, max(1, post_workers // 2)) if overlap_postprocess else 0
+            bg_post_workers = scheduler.background_postprocess_workers() if overlap_postprocess else 0
             bg_post_futures: dict = {}
             precomputed_post: dict[str, Path | None] = {}
             bg_post_broken = False
@@ -710,7 +833,12 @@ def _run_engine_stage(
                 overlap_post_pool = ProcessPoolExecutor(max_workers=bg_post_workers)
 
             prepare_started = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=engine_workers, thread_name_prefix="ecognition") as engine_pool:
+            owned_pool: ThreadPoolExecutor | None = (
+                None
+                if shared_pool is not None
+                else ThreadPoolExecutor(max_workers=tuner.max_workers, thread_name_prefix="ecognition")
+            )
+            try:
 
                 def collect_engine(completed_futures) -> None:
                     nonlocal engine_completed
@@ -726,28 +854,55 @@ def _run_engine_stage(
                         )
                         _release_engine_inputs(tile_root / completed_tile.tile_id, sandbox_root)
                         engine_completed += 1
+                        estimated_runnable = max(len(runnable), len(tiles) - len(skipped))
+                        context.emit("tile", "tile-map", "", tile_id=completed_tile.tile_id, state="done")
                         context.emit(
                             "progress",
                             "ecognition",
-                            f"eCognition completed {engine_resumed + engine_completed}/{len(runnable)} tiles",
+                            f"eCognition completed {engine_resumed + engine_completed}/{estimated_runnable} tiles",
                             completed=engine_resumed + engine_completed,
-                            total=len(runnable),
+                            total=estimated_runnable,
                         )
                         submit_bg_post(completed_tile)
                     drain_bg_post(block=False)
 
                 def submit_engine(tile: Tile) -> None:
-                    future = engine_pool.submit(run_tile, tile_root / tile.tile_id, sandbox_root, request, context)
+                    context.emit("tile", "tile-map", "", tile_id=tile.tile_id, state="running")
+                    if shared_pool is not None:
+                        future = shared_pool.submit(
+                            run_tile,
+                            tile_root / tile.tile_id,
+                            sandbox_root,
+                            request,
+                            context,
+                            context=context,
+                        )
+                    else:
+                        # Dynamically gate in-flight eCognition concurrency to track ~90% CPU/RAM safely.
+                        active_limit = tuner.recommended_concurrency()
+                        while len(engine_futures) >= active_limit:
+                            context.checkpoint()
+                            completed, _ = wait(engine_futures, return_when=FIRST_COMPLETED)
+                            collect_engine(completed)
+                            active_limit = tuner.recommended_concurrency()
+                        assert owned_pool is not None
+                        future = owned_pool.submit(run_tile, tile_root / tile.tile_id, sandbox_root, request, context)
                     engine_futures[future] = tile
                     done = [f for f in list(engine_futures) if f.done()]
                     if done:
                         collect_engine(done)
 
                 def apply_between_row_backpressure() -> None:
-                    while len(engine_futures) >= engine_workers * 2:
+                    active_limit = (
+                        shared_pool.active_limit() if shared_pool is not None else tuner.recommended_concurrency()
+                    )
+                    while len(engine_futures) >= active_limit + 2:
                         context.checkpoint()
                         completed, _ = wait(engine_futures, return_when=FIRST_COMPLETED)
                         collect_engine(completed)
+                        active_limit = (
+                            shared_pool.active_limit() if shared_pool is not None else tuner.recommended_concurrency()
+                        )
 
                 def _prepare_one(tile: Tile, tile_data, process_ds, base_ds, base_rdr):
                     context.checkpoint()
@@ -786,6 +941,13 @@ def _run_engine_stage(
                     rows: dict[int, list[Tile]] = {}
                     for tile in tiles:
                         rows.setdefault(tile.row, []).append(tile)
+                    if len(rows) > 1:
+                        context.emit(
+                            "stage",
+                            "scan",
+                            f"正在预扫描有效区域（共 {len(tiles)} 块瓦片）",
+                            total=len(tiles),
+                        )
                     ordered_row_indices = _order_rows_by_valid_density(
                         process, rows, request.options.invalid_pixel_values
                     )
@@ -810,6 +972,16 @@ def _run_engine_stage(
                             ):
                                 runnable.append(tile)
                                 engine_resumed += 1
+                                estimated_runnable = max(len(runnable), len(tiles) - len(skipped))
+                                done_engine = engine_resumed + engine_completed
+                                context.emit("tile", "tile-map", "", tile_id=tile.tile_id, state="done")
+                                context.emit(
+                                    "progress",
+                                    "ecognition",
+                                    f"eCognition completed {done_engine}/{estimated_runnable} tiles",
+                                    completed=done_engine,
+                                    total=estimated_runnable,
+                                )
                                 submit_bg_post(tile)
                                 continue
                             prepare_checkpoint = workspace.read_checkpoint(f"{tile.tile_id}-prepare")
@@ -821,6 +993,7 @@ def _run_engine_stage(
                                 and workspace.checkpoint_matches(f"{tile.tile_id}-prepare", prepare_fingerprint)
                             ):
                                 skipped.append(tile)
+                                context.emit("tile", "tile-map", "", tile_id=tile.tile_id, state="skipped")
                                 continue
                             prep_reqs = _tile_requirements(tile_dir, "prepare")
                             prepared_ok = (
@@ -875,6 +1048,7 @@ def _run_engine_stage(
                                     row_data.pop(tile.tile_id, None)
                                     if was_skipped:
                                         skipped.append(tile)
+                                        context.emit("tile", "tile-map", "", tile_id=tile.tile_id, state="skipped")
                                     else:
                                         runnable.append(tile)
                                         submit_engine(tile)
@@ -892,6 +1066,7 @@ def _run_engine_stage(
                                 )
                                 if was_skipped:
                                     skipped.append(tile)
+                                    context.emit("tile", "tile-map", "", tile_id=tile.tile_id, state="skipped")
                                     continue
                                 runnable.append(tile)
                                 submit_engine(tile)
@@ -912,8 +1087,23 @@ def _run_engine_stage(
                     )
                     prefetch_thread.start()
                 engine_wait_started = time.perf_counter()
-                collect_engine(list(as_completed(engine_futures)))
+                while engine_futures:
+                    context.checkpoint()
+                    active_limit = (
+                        shared_pool.active_limit() if shared_pool is not None else tuner.recommended_concurrency()
+                    )
+                    tail_threshold = max(2, active_limit // 2)
+                    spare = shared_pool.spare_capacity() if shared_pool is not None else 0
+                    if len(engine_futures) <= tail_threshold or spare >= max(2, active_limit // 3):
+                        notify_tail_ready()
+                    completed, _ = wait(engine_futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                    if completed:
+                        collect_engine(completed)
+                notify_tail_ready()
                 timings["engine_wait_after_prepare"] = round(time.perf_counter() - engine_wait_started, 6)
+            finally:
+                if owned_pool is not None:
+                    owned_pool.shutdown(wait=True)
             if prefetch_thread is not None:
                 prefetch_thread.join()
                 prefetch_thread = None
@@ -976,6 +1166,7 @@ def _run_engine_stage(
                 read_error=error.diagnostic if isinstance(error, RasterReadError) else None,
             )
         finally:
+            notify_tail_ready()
             if prefetch_thread is not None:
                 prefetch_thread.join()
             if not staged_ready and overlap_post_pool is not None:
@@ -1034,6 +1225,12 @@ def _finalize_segment_stage(staged: _StagedSegment, *, mosaic_workers: int | Non
                     )
             context.checkpoint()
             with StageTimer(timings, "mosaic"):
+                context.emit(
+                    "stage",
+                    "mosaic",
+                    f"正在拼接 {len(outputs)} 块瓦片矢量…",
+                    total=len(outputs),
+                )
                 staged_path = workspace.staging / request.output_vector.name
                 transform = staged.raster_shape[2]
                 pixel_area = abs(transform.a * transform.e - transform.b * transform.d)
@@ -1043,6 +1240,11 @@ def _finalize_segment_stage(staged: _StagedSegment, *, mosaic_workers: int | Non
                     features = assemble(outputs, staged_path, pixel_area)
             context.checkpoint()
             with StageTimer(timings, "publish"):
+                context.emit(
+                    "stage",
+                    "publish",
+                    f"正在发布矢量成果：{request.output_vector.name}",
+                )
                 publish_shapefile(staged_path, request.output_vector)
             timings["total"] = round(time.perf_counter() - staged.started, 6)
             peak_mb = max(staged.peak_memory_mb, memory.peak_mb)

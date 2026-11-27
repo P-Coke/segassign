@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import traceback
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -24,17 +26,32 @@ from .models import (
     ZonalRequest,
 )
 from .raster_batch import RasterMatcher, discover_rasters, output_vector_for, validate_output_directory
-from .runtime import CancelledError, EngineLease, RunContext, RunWorkspace
+from .runtime import CancelledError, EngineLease, ResourceScheduler, RunContext, RunWorkspace
 from .runtime.workspace import dataset_fingerprint, dataset_matches, file_fingerprint, stable_digest
 from .segment.engine import wait_for_external_engines
 from .segment.service import (
     _REAL_SEGMENT_RUN,
-    PrefetchedRow,
+    SharedEnginePool,
     _finalize_segment_stage,
     _run_engine_stage,
-    prefetch_first_row,
 )
 from .zonal.service import detect_raster_values
+
+_MATCH_LABELS = {
+    "shared": "全局共用",
+    "relative_path": "相对路径",
+    "stem": "同名匹配",
+    "spatial_overlap": "空间重叠",
+}
+
+
+def _relative_label(path: Path, root: Path) -> str:
+    if root.is_dir():
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            pass
+    return path.name
 
 
 def _remove_internal_segment(path: Path) -> None:
@@ -97,8 +114,28 @@ def plan(request: CompositeRequest) -> ExecutionPlan:
         (request.output_vector,),
         ("segment", "zonal", "report"),
         {
+            "items": 1,
             "segment": dict(segment_plan.metrics),
             "zonal": {"classification": classification, "valid_values": request.zonal_options.valid_values},
+            "items_preview": (
+                {
+                    "item_id": str(request.process_raster),
+                    "name": request.process_raster.name,
+                    "relative_path": request.process_raster.name,
+                    "output": str(request.output_vector),
+                    "output_name": request.output_vector.name,
+                    "size_summary": (
+                        f"{segment_plan.metrics['width']}×{segment_plan.metrics['height']} · "
+                        f"{segment_plan.metrics['bands']}波段 · {segment_plan.metrics['tiles']}块"
+                        if segment_plan.metrics.get("width") and segment_plan.metrics.get("height")
+                        else f"{int(segment_plan.metrics.get('tiles', 0))} 块瓦片"
+                    ),
+                    "auxiliary": f"基础：{request.base_raster.name} | 分类：{request.classification_raster.name}",
+                    "match_mode": "单景直连",
+                    "tiles_total": int(segment_plan.metrics["tiles"]),
+                },
+            ),
+            "warnings": [],
             "input_copy_bytes": 0,
         },
     )
@@ -122,6 +159,11 @@ def _complete_composite_from_segment(
             status = segment_result.status
             warnings = ("zonal was not started because segment did not succeed", *segment_result.warnings)
         else:
+            context.emit(
+                "stage",
+                "composite-zonal",
+                f"步骤 2/2：分类赋值（{zonal_template.raster.name}）",
+            )
             zonal_request = ZonalRequest(
                 segment_result.primary_vector,
                 zonal_template.raster,
@@ -250,6 +292,11 @@ def run(
             None,
         )
     context.emit("started", "composite", "Composite run started", plan=execution_plan.metrics)
+    context.emit(
+        "stage",
+        "composite-segment",
+        f"步骤 1/2：影像分割（{request.process_raster.name}）",
+    )
     segment_request, zonal_template = _requests(request)
     try:
         segment_result = segment.run(segment_request, context)
@@ -301,6 +348,11 @@ def _resolve_batch_items(
         (request.process_source, request.base_source, request.classification_source),
     )
     process_rasters = discover_rasters(request.process_source, recursive=request.recursive, label="亚米级影像")
+    if request.selected_inputs:
+        allowed = {str(path).casefold() for path in request.selected_inputs}
+        process_rasters = tuple(path for path in process_rasters if str(path).casefold() in allowed)
+        if not process_rasters:
+            raise ValueError("未勾选任何有效的亚米级影像，无法执行批量分割并赋值")
     base_matcher = RasterMatcher(
         request.base_source,
         recursive=request.recursive,
@@ -351,9 +403,35 @@ def _resolve_batch_items(
     return tuple(items), pairs, warnings
 
 
+def _segment_size_summary(seg_metrics: dict) -> str:
+    tiles = int(seg_metrics.get("tiles", 0))
+    width, height, bands = seg_metrics.get("width"), seg_metrics.get("height"), seg_metrics.get("bands")
+    if width and height:
+        band_text = f" · {bands}波段" if bands else ""
+        return f"{width}×{height}{band_text} · {tiles}块"
+    return f"{tiles} 块瓦片"
+
+
 def plan_batch(request: CompositeBatchRequest) -> ExecutionPlan:
     item_requests, pairs, warnings = _resolve_batch_items(request)
     item_plans = tuple(plan(item) for item in item_requests)
+    items_preview = tuple(
+        {
+            "item_id": str(item.process_raster),
+            "name": item.process_raster.name,
+            "relative_path": _relative_label(item.process_raster, request.process_source),
+            "output": str(item.output_vector),
+            "output_name": _relative_label(item.output_vector, request.output_directory),
+            "size_summary": _segment_size_summary(dict(item_plan.metrics.get("segment", {}))),
+            "auxiliary": f"基础：{item.base_raster.name} | 分类：{item.classification_raster.name}",
+            "match_mode": (
+                f"基础:{_MATCH_LABELS.get(pair['base_match'], pair['base_match'])} / "
+                f"分类:{_MATCH_LABELS.get(pair['classification_match'], pair['classification_match'])}"
+            ),
+            "tiles_total": int(item_plan.metrics.get("segment", {}).get("tiles", 0)),
+        }
+        for item, item_plan, pair in zip(item_requests, item_plans, pairs, strict=True)
+    )
     inputs = tuple(
         dict.fromkeys(
             [
@@ -375,6 +453,7 @@ def plan_batch(request: CompositeBatchRequest) -> ExecutionPlan:
             "recursive": request.recursive,
             "valid_values": request.zonal_options.valid_values,
             "pairs": pairs,
+            "items_preview": items_preview,
             "warnings": warnings,
             "input_copy_bytes": 0,
         },
@@ -486,6 +565,11 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
     detected_cache: dict[Path, tuple[int, ...]] = {}
     if not request.zonal_options.valid_values and request.classification_source.is_file():
         try:
+            context.emit(
+                "stage",
+                "scan",
+                f"正在识别分类影像有效像元值：{request.classification_source.name}",
+            )
             detected_cache[request.classification_source] = detect_raster_values(
                 request.classification_source,
                 request.zonal_options.nodata,
@@ -513,7 +597,12 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
                 warnings.append(str(error))
                 cancelled = True
                 break
-            context.emit(
+            item_ctx = context.scoped(
+                item_id=str(item.process_raster),
+                item_index=index,
+                item_name=item.process_raster.name,
+            )
+            item_ctx.emit(
                 "progress",
                 "batch",
                 f"正在处理 {index}/{len(item_requests)}：{item.process_raster.name}",
@@ -524,11 +613,11 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
             cached_values = detected_cache.get(item.classification_raster)
             if cached_values is not None:
                 try:
-                    result = run(item, context, predetected_values=cached_values)
+                    result = run(item, item_ctx, predetected_values=cached_values)
                 except TypeError:
-                    result = run(item, context)
+                    result = run(item, item_ctx)
             else:
-                result = run(item, context)
+                result = run(item, item_ctx)
             results.append(result)
             if result.status is TaskStatus.CANCELLED:
                 cancelled = True
@@ -537,19 +626,20 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
             if result.status is not TaskStatus.SUCCEEDED:
                 warnings.append(f"{item.process_raster}: {result.status.value}")
                 warnings.extend(result.warnings)
-            context.emit(
+            item_ctx.emit(
                 "progress",
                 "batch",
                 f"已完成 {index}/{len(item_requests)}：{item.process_raster.name}",
                 completed=index,
                 total=len(item_requests),
                 output=str(item.output_vector),
+                item_status=result.status.value,
             )
     else:
         ordered_results: list[CompositeResult | None] = [None] * len(item_requests)
         completed_count = 0
 
-        def record_result(idx: int, item: CompositeRequest, result: CompositeResult) -> None:
+        def record_result(idx: int, item: CompositeRequest, item_ctx: RunContext, result: CompositeResult) -> None:
             nonlocal completed_count, cancelled
             ordered_results[idx] = result
             completed_count += 1
@@ -559,29 +649,22 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
             elif result.status is not TaskStatus.SUCCEEDED:
                 warnings.append(f"{item.process_raster}: {result.status.value}")
                 warnings.extend(result.warnings)
-            context.emit(
+            item_ctx.emit(
                 "progress",
                 "batch",
                 f"已完成 {completed_count}/{len(item_requests)}：{item.process_raster.name}",
                 completed=completed_count,
                 total=len(item_requests),
                 output=str(item.output_vector),
+                item_status=result.status.value,
             )
 
-        bg_zonal_workers = max(1, min(4, context.resources.logical_cpus // 4))
-        bg_zonal_context = RunContext(
-            work_dir=context.work_dir,
-            cancellation=context.cancellation,
-            event_sink=context.event_sink,
-            resources=replace(context.resources, raster_workers=bg_zonal_workers),
-            resume=context.resume,
-            cleanup_on_success=context.cleanup_on_success,
-            task_id=context.task_id,
-        )
+        bg_zonal_workers = ResourceScheduler(context.resources).background_zonal_workers()
 
         def _finalize_composite(
             item: CompositeRequest,
             zonal_template: ZonalRequest,
+            item_ctx: RunContext,
             item_ws: RunWorkspace,
             item_fp: str,
             item_started: float,
@@ -592,29 +675,99 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
             if isinstance(staged, SegmentResult):
                 seg_result = staged
             else:
-                m_workers = min(4, staged.post_workers) if concurrent_with_engine else staged.post_workers
+                m_workers = min(6, staged.post_workers) if concurrent_with_engine else staged.post_workers
                 seg_result = _finalize_segment_stage(staged, mosaic_workers=m_workers)
+            zonal_ctx = (
+                item_ctx.scoped(resources=replace(item_ctx.resources, raster_workers=bg_zonal_workers))
+                if concurrent_with_engine
+                else item_ctx
+            )
             return _complete_composite_from_segment(
                 item,
                 zonal_template,
-                context,
+                item_ctx,
                 item_ws,
                 item_fp,
                 item_started,
                 seg_result,
                 predetected_values=detected_cache.get(item.classification_raster),
-                zonal_context=bg_zonal_context if concurrent_with_engine else context,
+                zonal_context=zonal_ctx,
             )
 
         segment_requests = [_requests(item) for item in item_requests]
-        prefetched_by_index: dict[int, PrefetchedRow | None] = {}
-        pending_finalize: tuple[int, CompositeRequest, Future] | None = None
+        pending_scenes: deque[
+            tuple[int, CompositeRequest, ZonalRequest, RunContext, RunWorkspace, str, float, Future, threading.Event]
+        ] = deque()
+        pending_finalize: tuple[int, CompositeRequest, RunContext, Future] | None = None
         engine_lease = EngineLease(context)
         try:
             engine_lease.__enter__()
             wait_for_external_engines(context)
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="comp-finalize") as finalize_pool:
+            with (
+                SharedEnginePool(context, request.segment_options.ecognition_workers) as shared_pool,
+                ThreadPoolExecutor(max_workers=2, thread_name_prefix="comp-scene") as scene_pool,
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix="comp-finalize") as finalize_pool,
+            ):
+
+                def drain_oldest_scene() -> None:
+                    nonlocal pending_finalize, cancelled
+                    (
+                        old_idx,
+                        old_item,
+                        old_zonal_tpl,
+                        old_ctx,
+                        old_ws,
+                        old_fp,
+                        old_started,
+                        old_future,
+                        _,
+                    ) = pending_scenes.popleft()
+                    staged = old_future.result()
+                    if pending_finalize is not None:
+                        prev_idx, prev_item, prev_ctx, prev_future = pending_finalize
+                        pending_finalize = None
+                        record_result(prev_idx, prev_item, prev_ctx, prev_future.result())
+                    if isinstance(staged, SegmentResult) and staged.status is TaskStatus.CANCELLED:
+                        record_result(
+                            old_idx,
+                            old_item,
+                            old_ctx,
+                            _complete_composite_from_segment(
+                                old_item, old_zonal_tpl, old_ctx, old_ws, old_fp, old_started, staged
+                            ),
+                        )
+                        cancelled = True
+                        return
+                    pending_finalize = (
+                        old_idx,
+                        old_item,
+                        old_ctx,
+                        finalize_pool.submit(
+                            _finalize_composite,
+                            old_item,
+                            old_zonal_tpl,
+                            old_ctx,
+                            old_ws,
+                            old_fp,
+                            old_started,
+                            staged,
+                            concurrent_with_engine=bool(pending_scenes),
+                        ),
+                    )
+
                 for idx, item in enumerate(item_requests):
+                    if len(pending_scenes) >= 2:
+                        drain_oldest_scene()
+                        if cancelled:
+                            break
+                    if pending_scenes:
+                        prev_tail_event = pending_scenes[-1][8]
+                        while not prev_tail_event.wait(timeout=0.2):
+                            context.checkpoint()
+                        if pending_scenes and pending_scenes[0][7].done():
+                            drain_oldest_scene()
+                            if cancelled:
+                                break
                     try:
                         context.checkpoint()
                     except CancelledError as error:
@@ -625,6 +778,11 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
                     item_fp = _composite_fingerprint(item)
                     item_ws = RunWorkspace(context.work_dir, "composite", item_fp, context.resume)
                     item_ws.ensure()
+                    item_ctx = context.scoped(
+                        item_id=str(item.process_raster),
+                        item_index=idx + 1,
+                        item_name=item.process_raster.name,
+                    )
                     item_complete = item_ws.read_checkpoint("complete")
                     if (
                         context.resume
@@ -637,6 +795,7 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
                         record_result(
                             idx,
                             item,
+                            item_ctx,
                             CompositeResult(
                                 TaskStatus.SUCCEEDED,
                                 (Artifact("primary_vector", item.output_vector), Artifact("run_report", report)),
@@ -650,7 +809,7 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
                             ),
                         )
                         continue
-                    context.emit(
+                    item_ctx.emit(
                         "progress",
                         "batch",
                         f"正在处理 {idx + 1}/{len(item_requests)}：{item.process_raster.name}",
@@ -659,54 +818,24 @@ def run_batch(request: CompositeBatchRequest, context: RunContext | None = None)
                         input=str(item.process_raster),
                     )
                     seg_req, zonal_tpl = segment_requests[idx]
-                    next_idx = idx + 1
-
-                    def _make_prefetch(target_idx: int):
-                        def _do_prefetch() -> None:
-                            prefetched_by_index[target_idx] = prefetch_first_row(
-                                segment_requests[target_idx][0], context
-                            )
-
-                        return _do_prefetch
-
-                    on_prep_done = _make_prefetch(next_idx) if next_idx < len(item_requests) else None
-                    staged = _run_engine_stage(
+                    tail_event = threading.Event()
+                    scene_future = scene_pool.submit(
+                        _run_engine_stage,
                         seg_req,
-                        context,
+                        item_ctx,
                         hold_lease=False,
-                        prefetched=prefetched_by_index.pop(idx, None),
-                        on_prepare_complete=on_prep_done,
+                        shared_pool=shared_pool,
+                        on_tail_ready=tail_event.set,
                     )
-                    if pending_finalize is not None:
-                        prev_idx, prev_item, prev_future = pending_finalize
-                        pending_finalize = None
-                        record_result(prev_idx, prev_item, prev_future.result())
-                    if isinstance(staged, SegmentResult) and staged.status is TaskStatus.CANCELLED:
-                        record_result(
-                            idx,
-                            item,
-                            _complete_composite_from_segment(
-                                item, zonal_tpl, context, item_ws, item_fp, item_started, staged
-                            ),
-                        )
-                        break
-                    pending_finalize = (
-                        idx,
-                        item,
-                        finalize_pool.submit(
-                            _finalize_composite,
-                            item,
-                            zonal_tpl,
-                            item_ws,
-                            item_fp,
-                            item_started,
-                            staged,
-                            concurrent_with_engine=next_idx < len(item_requests),
-                        ),
+                    pending_scenes.append(
+                        (idx, item, zonal_tpl, item_ctx, item_ws, item_fp, item_started, scene_future, tail_event)
                     )
+
+                while pending_scenes:
+                    drain_oldest_scene()
                 if pending_finalize is not None:
-                    prev_idx, prev_item, prev_future = pending_finalize
-                    record_result(prev_idx, prev_item, prev_future.result())
+                    prev_idx, prev_item, prev_ctx, prev_future = pending_finalize
+                    record_result(prev_idx, prev_item, prev_ctx, prev_future.result())
         except CancelledError as error:
             warnings.append(str(error))
             cancelled = True

@@ -1,9 +1,11 @@
-"""Native, resumable orchestration for assigning one raster to many Shapefiles."""
+"""Native, resumable orchestration for assigning one raster to many Shapefiles with tail overlap."""
 
 from __future__ import annotations
 
+import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from ..models import (
 from ..runtime import CancelledError, ResourceScheduler, RunContext, RunWorkspace
 from ..runtime.workspace import dataset_fingerprint, dataset_matches, file_fingerprint, stable_digest
 from .service import detect_raster_values, plan, run
+
+_REAL_ZONAL_RUN = run
 
 
 def discover_vectors(source: Path, recursive: bool = True) -> tuple[Path, ...]:
@@ -46,8 +50,22 @@ def discover_vectors(source: Path, recursive: bool = True) -> tuple[Path, ...]:
     return vectors
 
 
+def _relative_label(path: Path, root: Path) -> str:
+    if root.is_dir():
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            pass
+    return path.name
+
+
 def _requests(request: ZonalBatchRequest) -> tuple[ZonalRequest, ...]:
     vectors = discover_vectors(request.vector_source, request.recursive)
+    if request.selected_inputs:
+        allowed = {str(path).casefold() for path in request.selected_inputs}
+        vectors = tuple(path for path in vectors if str(path).casefold() in allowed)
+        if not vectors:
+            raise ValueError("未勾选任何有效的矢量 Shapefile，无法执行批量赋值")
     source_root = request.vector_source if request.vector_source.is_dir() else request.vector_source.parent
     if request.vector_source.is_dir() and (
         request.output_directory == source_root or source_root in request.output_directory.parents
@@ -80,6 +98,20 @@ def plan_batch(request: ZonalBatchRequest) -> ExecutionPlan:
         }
     item_requests = _requests(request)
     item_plans = tuple(plan(item, raster_metadata=raster_metadata) for item in item_requests)
+    items_preview = tuple(
+        {
+            "item_id": str(item.vector),
+            "name": item.vector.name,
+            "relative_path": _relative_label(item.vector, request.vector_source),
+            "output": str(item.output_vector),
+            "output_name": _relative_label(item.output_vector, request.output_directory),
+            "size_summary": f"{int(item_plan.metrics['features']):,} 个面要素",
+            "auxiliary": f"分类：{request.raster.name}",
+            "match_mode": "全局共用" if len(item_requests) > 1 else "单文件直连",
+            "tiles_total": None,
+        }
+        for item, item_plan in zip(item_requests, item_plans, strict=True)
+    )
     return ExecutionPlan(
         tool="zonal-batch",
         inputs=(*tuple(item.vector for item in item_requests), request.raster),
@@ -88,22 +120,17 @@ def plan_batch(request: ZonalBatchRequest) -> ExecutionPlan:
         metrics={
             "items": len(item_requests),
             "features": sum(int(item.metrics["features"]) for item in item_plans),
-            "recursive": request.recursive,
+            "tile_size": request.options.tile_size,
             "valid_values": request.options.valid_values,
+            "recursive": request.recursive,
+            "items_preview": items_preview,
+            "warnings": [],
             "input_copy_bytes": 0,
         },
     )
 
 
-def _batch_result(
-    status: TaskStatus,
-    request: ZonalBatchRequest,
-    workspace: RunWorkspace,
-    started: float,
-    results,
-    warnings,
-    items_total: int,
-) -> ZonalBatchResult:
+def _batch_result(status, request, workspace, started, results, warnings, items_total):
     succeeded = tuple(result for result in results if result.status is TaskStatus.SUCCEEDED)
     outputs = tuple(result.primary_vector for result in succeeded)
     timings = {
@@ -116,7 +143,7 @@ def _batch_result(
         {
             "tool": "zonal-batch",
             "status": status.value,
-            "input": str(request.vector_source),
+            "vector_source": str(request.vector_source),
             "raster": str(request.raster),
             "output_directory": str(request.output_directory),
             "items_total": items_total,
@@ -153,7 +180,7 @@ def _pool_workers(request: ZonalBatchRequest, context: RunContext) -> int:
 
 
 def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> ZonalBatchResult:
-    """Run discovered items reusing one raster scan and one shared worker pool."""
+    """Assign one classification raster to every discovered Shapefile with tail-overlap execution."""
     started = time.perf_counter()
     execution_plan = plan_batch(request)
     item_requests = _requests(request)
@@ -161,7 +188,10 @@ def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> 
     fingerprint = stable_digest(
         {
             "request": request,
-            "vectors": [dataset_fingerprint(item.vector) for item in item_requests],
+            "items": [
+                {"vector": dataset_fingerprint(item.vector), "output": str(item.output_vector)}
+                for item in item_requests
+            ],
             "raster": file_fingerprint(request.raster),
         }
     )
@@ -192,28 +222,106 @@ def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> 
             )
 
     context.emit("started", "zonal-batch", "批量分类赋值开始", plan=execution_plan.metrics)
-    results = []
     warnings: list[str] = []
     cancelled = False
     predetected_values: tuple[int, ...] | None = request.options.valid_values or None
     if predetected_values is None:
         try:
+            context.emit(
+                "stage",
+                "scan",
+                f"正在识别分类影像有效像元值：{request.raster.name}",
+            )
             predetected_values = detect_raster_values(request.raster, request.options.nodata, context)
         except CancelledError as error:
             warnings.append(str(error))
             cancelled = True
 
-    # Reuse one ProcessPoolExecutor across multi-item batches to eliminate
-    # per-file Windows process spawn overhead.
     use_shared_pool = (
         not cancelled
+        and run is _REAL_ZONAL_RUN
         and len(item_requests) > 1
         and all(item.vector.suffix.casefold() == ".shp" for item in item_requests)
     )
     pool_workers = _pool_workers(request, context) if use_shared_pool else 1
     shared_executor = ProcessPoolExecutor(max_workers=pool_workers) if (use_shared_pool and pool_workers > 1) else None
+    results = []
     try:
-        if not cancelled:
+        if not cancelled and shared_executor is not None:
+            ordered_results: list = [None] * len(item_requests)
+            completed_count = 0
+
+            def record_item(idx: int, item: ZonalRequest, item_ctx: RunContext, item_result) -> None:
+                nonlocal completed_count, cancelled
+                ordered_results[idx] = item_result
+                completed_count += 1
+                if item_result.status is TaskStatus.CANCELLED:
+                    cancelled = True
+                    warnings.extend(item_result.warnings)
+                elif item_result.status is not TaskStatus.SUCCEEDED:
+                    warnings.append(f"{item.vector}: {item_result.status.value}")
+                    warnings.extend(item_result.warnings)
+                item_ctx.emit(
+                    "progress",
+                    "batch",
+                    f"已完成 {completed_count}/{len(item_requests)}：{item.vector.name}",
+                    completed=completed_count,
+                    total=len(item_requests),
+                    output=str(item.output_vector),
+                    item_status=item_result.status.value,
+                )
+
+            pending: deque[tuple[int, ZonalRequest, RunContext, Future, threading.Event]] = deque()
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="zonal-item") as item_pool:
+                for idx, item in enumerate(item_requests):
+                    if len(pending) >= 2:
+                        old_idx, old_item, old_ctx, old_fut, _ = pending.popleft()
+                        record_item(old_idx, old_item, old_ctx, old_fut.result())
+                        if cancelled:
+                            break
+                    if pending:
+                        prev_tail = pending[-1][4]
+                        while not prev_tail.wait(timeout=0.2):
+                            context.checkpoint()
+                        if pending and pending[0][3].done():
+                            old_idx, old_item, old_ctx, old_fut, _ = pending.popleft()
+                            record_item(old_idx, old_item, old_ctx, old_fut.result())
+                            if cancelled:
+                                break
+                    try:
+                        context.checkpoint()
+                    except CancelledError as error:
+                        warnings.append(str(error))
+                        cancelled = True
+                        break
+                    item_ctx = context.scoped(
+                        item_id=str(item.vector),
+                        item_index=idx + 1,
+                        item_name=item.vector.name,
+                    )
+                    item_ctx.emit(
+                        "progress",
+                        "batch",
+                        f"正在处理 {idx + 1}/{len(item_requests)}：{item.vector.name}",
+                        completed=completed_count,
+                        total=len(item_requests),
+                        input=str(item.vector),
+                    )
+                    tail_event = threading.Event()
+                    fut = item_pool.submit(
+                        run,
+                        item,
+                        item_ctx,
+                        shared_executor=shared_executor,
+                        predetected_values=predetected_values,
+                        on_tail_ready=tail_event.set,
+                    )
+                    pending.append((idx, item, item_ctx, fut, tail_event))
+                while pending:
+                    old_idx, old_item, old_ctx, old_fut, _ = pending.popleft()
+                    record_item(old_idx, old_item, old_ctx, old_fut.result())
+            results = [res for res in ordered_results if res is not None]
+        elif not cancelled:
             for index, item in enumerate(item_requests, 1):
                 try:
                     context.checkpoint()
@@ -221,7 +329,12 @@ def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> 
                     warnings.append(str(error))
                     cancelled = True
                     break
-                context.emit(
+                item_ctx = context.scoped(
+                    item_id=str(item.vector),
+                    item_index=index,
+                    item_name=item.vector.name,
+                )
+                item_ctx.emit(
                     "progress",
                     "batch",
                     f"正在处理 {index}/{len(item_requests)}：{item.vector.name}",
@@ -229,35 +342,37 @@ def run_batch(request: ZonalBatchRequest, context: RunContext | None = None) -> 
                     total=len(item_requests),
                     input=str(item.vector),
                 )
-                if shared_executor is not None or predetected_values is not None:
+                if predetected_values is not None:
                     try:
-                        result = run(
+                        item_result = run(
                             item,
-                            context,
-                            shared_executor=shared_executor,
+                            item_ctx,
                             predetected_values=predetected_values,
                         )
                     except TypeError:
-                        # Allows unit tests to monkeypatch batch.run with a 2-arg stub.
-                        result = run(item, context)
+                        item_result = run(item, item_ctx)
                 else:
-                    result = run(item, context)
-                results.append(result)
-                if result.status is TaskStatus.CANCELLED:
+                    item_result = run(item, item_ctx)
+                results.append(item_result)
+                if item_result.status is TaskStatus.CANCELLED:
                     cancelled = True
-                    warnings.extend(result.warnings)
+                    warnings.extend(item_result.warnings)
                     break
-                if result.status is not TaskStatus.SUCCEEDED:
-                    warnings.append(f"{item.vector}: {result.status.value}")
-                    warnings.extend(result.warnings)
-                context.emit(
+                if item_result.status is not TaskStatus.SUCCEEDED:
+                    warnings.append(f"{item.vector}: {item_result.status.value}")
+                    warnings.extend(item_result.warnings)
+                item_ctx.emit(
                     "progress",
                     "batch",
                     f"已完成 {index}/{len(item_requests)}：{item.vector.name}",
                     completed=index,
                     total=len(item_requests),
                     output=str(item.output_vector),
+                    item_status=item_result.status.value,
                 )
+    except CancelledError as error:
+        warnings.append(str(error))
+        cancelled = True
     finally:
         if shared_executor is not None:
             shared_executor.shutdown(wait=True)

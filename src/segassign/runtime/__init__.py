@@ -3,9 +3,11 @@
 from .context import CancellationToken, CancelledError, EventQueue, EventSink, RunContext
 from .hardware import (
     DriveInfo,
+    DynamicAutoTuner,
     HardwareProfile,
     adapt_tile_size,
     build_resource_budget,
+    configure_gdal_cache,
     detect_hardware,
     discover_drives,
     select_best_cache_drive,
@@ -18,6 +20,7 @@ __all__ = [
     "CancellationToken",
     "CancelledError",
     "DriveInfo",
+    "DynamicAutoTuner",
     "EngineLease",
     "EventQueue",
     "EventSink",
@@ -31,6 +34,7 @@ __all__ = [
     "build_resource_budget",
     "cache_usage_bytes",
     "clear_cache",
+    "configure_gdal_cache",
     "detect_hardware",
     "discover_drives",
     "prune_expired_cache",

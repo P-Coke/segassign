@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -219,9 +220,21 @@ def run(
     *,
     shared_executor: ProcessPoolExecutor | None = None,
     predetected_values: tuple[int, ...] | None = None,
+    on_tail_ready: Callable[[], None] | None = None,
 ) -> ZonalResult:
     started = time.perf_counter()
     timings: dict[str, float] = {}
+    tail_notified = False
+
+    def notify_tail_ready() -> None:
+        nonlocal tail_notified
+        if not tail_notified and on_tail_ready is not None:
+            tail_notified = True
+            try:
+                on_tail_ready()
+            except Exception:
+                pass
+
     # This validation is deliberately before RunWorkspace.ensure(): invalid requests write nothing.
     execution_plan = plan(request)
     context = context or RunContext(request.output_vector.parent / ".geotoolbox-work")
@@ -243,6 +256,7 @@ def run(
         and Path(complete.get("report", "")).is_file()
     ):
         report = Path(complete["report"])
+        notify_tail_ready()
         return ZonalResult(
             TaskStatus.SUCCEEDED,
             (Artifact("primary_vector", request.output_vector), Artifact("run_report", report)),
@@ -264,6 +278,11 @@ def run(
                 elif predetected_values is not None:
                     values = predetected_values
                 else:
+                    context.emit(
+                        "stage",
+                        "scan",
+                        f"正在识别分类影像有效像元值：{request.raster.name}",
+                    )
                     values = detect_raster_values(request.raster, request.options.nodata, context)
                 encoding = ClassEncoding.create(values) if values else None
                 fast_shapefile = request.vector.suffix.casefold() == ".shp"
@@ -288,6 +307,12 @@ def run(
                     feature_count = len(frame)
                     spatial_index_cache_hit = False
             with StageTimer(timings, "spatial_index"):
+                context.emit(
+                    "stage",
+                    "index",
+                    f"正在构建空间索引（{feature_count} 个面要素）…",
+                    total=feature_count,
+                )
                 geometry_bounds = _geometry_bounds(geometries)
                 intersection = (
                     intersect_bounds(geometry_bounds, raster_bounds)
@@ -315,6 +340,28 @@ def run(
                         request.options.tile_size,
                     )
             candidate_queries = sum(job.candidates.size for job in jobs)
+            if jobs:
+                context.emit(
+                    "grid",
+                    "tile-map",
+                    f"已规划 {len(jobs)} 个栅格统计窗口",
+                    width=raster_width,
+                    height=raster_height,
+                    crs=str(raster_crs),
+                    bounds=[float(v) for v in raster_bounds],
+                    tiles=[
+                        (
+                            f"w{idx}",
+                            int(job.window.col_off),
+                            int(job.window.row_off),
+                            int(job.window.width),
+                            int(job.window.height),
+                            "pending" if job.candidates.size else "skipped",
+                        )
+                        for idx, job in enumerate(jobs)
+                    ],
+                )
+            job_tile_ids = {id(job): f"w{idx}" for idx, job in enumerate(jobs)}
             scheduler = ResourceScheduler(context.resources)
             bytes_per_worker = request.options.tile_size**2 * 16
             requested = request.options.workers or context.resources.raster_workers
@@ -329,6 +376,8 @@ def run(
                 if batches:
                     if fast_shapefile and (len(batches) == 1 or workers == 1):
                         # Avoid ~2s Windows process-spawn overhead for single-batch Shapefiles.
+                        batch_ids = [job_tile_ids[id(j)] for j in batches[0]]
+                        context.emit("tile", "tile-map", "", tile_ids=batch_ids, state="running")
                         positions, local, window_count = _process_shapefile_batch(
                             request,
                             batches[0],
@@ -338,6 +387,7 @@ def run(
                         )
                         counts[positions] += local
                         completed += window_count
+                        context.emit("tile", "tile-map", "", tile_ids=batch_ids, state="done")
                         context.emit(
                             "progress",
                             "count",
@@ -346,8 +396,11 @@ def run(
                             total=len(nonempty_jobs),
                         )
                     elif fast_shapefile and shared_executor is not None:
-                        futures = [
-                            shared_executor.submit(
+                        future_to_ids = {}
+                        for batch in batches:
+                            ids = [job_tile_ids[id(j)] for j in batch]
+                            context.emit("tile", "tile-map", "", tile_ids=ids, state="running")
+                            fut = shared_executor.submit(
                                 _process_shapefile_batch,
                                 request,
                                 batch,
@@ -355,12 +408,17 @@ def run(
                                 vector_crs,
                                 raster_crs,
                             )
-                            for batch in batches
-                        ]
-                        for future in as_completed(futures):
+                            future_to_ids[fut] = ids
+                        remaining_batches = len(future_to_ids)
+                        tail_trigger = max(1, len(future_to_ids) // 2)
+                        for future in as_completed(future_to_ids):
                             positions, local, window_count = future.result()
                             counts[positions] += local
                             completed += window_count
+                            remaining_batches -= 1
+                            context.emit("tile", "tile-map", "", tile_ids=future_to_ids[future], state="done")
+                            if remaining_batches <= tail_trigger:
+                                notify_tail_ready()
                             context.emit(
                                 "progress",
                                 "count",
@@ -371,9 +429,12 @@ def run(
                     else:
                         executor_class = ProcessPoolExecutor if fast_shapefile else ThreadPoolExecutor
                         with executor_class(max_workers=min(workers, len(batches))) as executor:
-                            if fast_shapefile:
-                                futures = [
-                                    executor.submit(
+                            future_to_ids = {}
+                            for batch in batches:
+                                ids = [job_tile_ids[id(j)] for j in batch]
+                                context.emit("tile", "tile-map", "", tile_ids=ids, state="running")
+                                if fast_shapefile:
+                                    fut = executor.submit(
                                         _process_shapefile_batch,
                                         request,
                                         batch,
@@ -381,14 +442,10 @@ def run(
                                         vector_crs,
                                         raster_crs,
                                     )
-                                    for batch in batches
-                                ]
-                            else:
-                                futures = [
-                                    executor.submit(_process_batch, request, geometries, batch, encoding, context)
-                                    for batch in batches
-                                ]
-                            for future in as_completed(futures):
+                                else:
+                                    fut = executor.submit(_process_batch, request, geometries, batch, encoding, context)
+                                future_to_ids[fut] = ids
+                            for future in as_completed(future_to_ids):
                                 if fast_shapefile:
                                     positions, local, window_count = future.result()
                                     counts[positions] += local
@@ -396,6 +453,7 @@ def run(
                                     local, window_count = future.result()
                                     counts += local
                                 completed += window_count
+                                context.emit("tile", "tile-map", "", tile_ids=future_to_ids[future], state="done")
                                 context.emit(
                                     "progress",
                                     "count",
@@ -404,7 +462,14 @@ def run(
                                     total=len(nonempty_jobs),
                                 )
             context.checkpoint()
+            # Counting CPU work is complete; let the next batch item overlap with I/O-bound write/publish.
+            notify_tail_ready()
             with StageTimer(timings, "write"):
+                context.emit(
+                    "stage",
+                    "write",
+                    f"正在写入统计字段与计数文件（{feature_count} 个面要素）…",
+                )
                 combined_values, combined_counts = merge_counts(
                     read_count_state(request.vector, feature_count),
                     np.asarray(values, dtype=np.int64),
@@ -448,6 +513,11 @@ def run(
                 write_count_state(staged, combined_values, combined_counts)
             context.checkpoint()
             with StageTimer(timings, "publish"):
+                context.emit(
+                    "stage",
+                    "publish",
+                    f"正在发布赋值结果：{request.output_vector.name}",
+                )
                 publish_shapefile(staged, request.output_vector)
             timings["total"] = round(time.perf_counter() - started, 6)
             report = workspace.report(
@@ -494,10 +564,12 @@ def run(
                 int(np.count_nonzero(combined_counts.sum(axis=1))),
             )
         except CancelledError as error:
+            notify_tail_ready()
             timings["total"] = round(time.perf_counter() - started, 6)
             context.emit("cancelled", "zonal", str(error))
             return _failure_result(request, workspace, timings, memory, TaskStatus.CANCELLED, str(error))
         except Exception as error:  # API boundary: diagnostics belong in the result/report.
+            notify_tail_ready()
             timings["total"] = round(time.perf_counter() - started, 6)
             detail = f"{type(error).__name__}: {error}"
             context.emit("failed", "zonal", detail)

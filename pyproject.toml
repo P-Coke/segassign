@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "segassign"
-version = "2.1.0"
+version = "2.2.0"
 description = "Remote-sensing research automation for segmentation and vector assignment"
 readme = "README.md"
 requires-python = ">=3.11"

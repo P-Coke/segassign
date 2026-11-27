@@ -15,12 +15,14 @@ from shapely.geometry import box
 from segassign import RunContext, TaskStatus, ZonalOptions, ZonalRequest, zonal
 from segassign.runtime import (
     DriveInfo,
+    DynamicAutoTuner,
     HardwareProfile,
     RunWorkspace,
     adapt_tile_size,
     build_resource_budget,
     cache_usage_bytes,
     clear_cache,
+    configure_gdal_cache,
     prune_expired_cache,
     select_best_cache_drive,
 )
@@ -42,7 +44,7 @@ def test_select_best_cache_drive_prefers_non_system_nvme_with_room():
     assert best.mount == Path("D:/")
 
 
-def test_build_resource_budget_scales_with_physical_cores_and_available_ram():
+def test_build_resource_budget_scales_aggressively_to_90pct_and_guards_tight_ram():
     laptop = HardwareProfile(
         physical_cores=14,
         logical_cpus=20,
@@ -56,8 +58,11 @@ def test_build_resource_budget_scales_with_physical_cores_and_available_ram():
     high = build_resource_budget(laptop, "high")
 
     assert low.ecognition_workers < auto.ecognition_workers <= high.ecognition_workers
-    assert auto.ecognition_workers == 12
-    assert high.ecognition_workers == 14
+    assert auto.memory_fraction == 0.90
+    assert auto.ecognition_workers >= 14
+    assert auto.raster_workers == 18
+    assert high.memory_fraction == 0.92
+    assert high.ecognition_workers >= auto.ecognition_workers
 
     tight_ram = HardwareProfile(
         physical_cores=16,
@@ -68,7 +73,48 @@ def test_build_resource_budget_scales_with_physical_cores_and_available_ram():
         cache_drive_label="D: (NVMe)",
     )
     auto_tight = build_resource_budget(tight_ram, "auto")
-    assert auto_tight.ecognition_workers <= 5
+    assert auto_tight.ecognition_workers <= 6
+
+
+def test_dynamic_auto_tuner_ramps_up_toward_90pct_and_throttles_on_ram_pressure(monkeypatch):
+    now = [0.0]
+    readings = iter(
+        [
+            (60.0, 68.0),  # plenty of headroom -> +1
+            (72.0, 75.0),  # still below 86% RAM / 87% CPU -> +1
+            (85.0, 91.0),  # RAM >= 90% -> -1
+            (88.0, 94.0),  # RAM >= 93% -> -2
+        ]
+    )
+    tuner = DynamicAutoTuner(
+        initial_workers=8,
+        min_workers=4,
+        max_workers=16,
+        target_cpu_pct=90.0,
+        target_ram_pct=90.0,
+        sample_interval=2.0,
+        clock=lambda: now[0],
+        sampler=lambda: next(readings),
+    )
+
+    # Before sample_interval, returns cached concurrency without sampling.
+    assert tuner.recommended_concurrency() == 8
+    now[0] += 2.5
+    assert tuner.recommended_concurrency() == 9
+    now[0] += 2.5
+    assert tuner.recommended_concurrency() == 10
+    now[0] += 2.5
+    assert tuner.recommended_concurrency() == 9
+    now[0] += 2.5
+    assert tuner.recommended_concurrency() == 7
+    assert tuner.adjustments == 4
+    assert tuner.peak_workers == 10
+
+    monkeypatch.delenv("GDAL_CACHEMAX", raising=False)
+    cache_mb = configure_gdal_cache(
+        HardwareProfile(14, 20, 24.0, 16.0, Path("D:/SegAssign-Cache"), "D: (NVMe)")
+    )
+    assert 1024 <= cache_mb <= 2048
 
 
 def test_adapt_tile_size_shrinks_medium_rasters_and_keeps_3072_for_full_scenes():

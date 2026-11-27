@@ -31,6 +31,7 @@ class _BackendWorker(QObject):
 
 class TaskController(QObject):
     event_received = Signal(dict)
+    events_batch = Signal(list)
     result_ready = Signal(object)
     failed = Signal(str)
     running_changed = Signal(bool)
@@ -42,7 +43,7 @@ class TaskController(QObject):
         self._cancellation: CancellationToken | None = None
         self._events = EventQueue()
         self._timer = QTimer(self)
-        self._timer.setInterval(100)
+        self._timer.setInterval(250)
         self._timer.timeout.connect(self._drain_events)
 
     @property
@@ -93,8 +94,12 @@ class TaskController(QObject):
 
     @Slot()
     def _drain_events(self) -> None:
-        for event in self._events.drain():
-            self.event_received.emit(event.serializable())
+        batch = [event.serializable() for event in self._events.drain()]
+        if not batch:
+            return
+        self.events_batch.emit(batch)
+        for item in batch:
+            self.event_received.emit(item)
 
     @Slot(object)
     def _on_completed(self, result) -> None:

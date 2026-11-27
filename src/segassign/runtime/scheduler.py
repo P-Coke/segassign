@@ -81,21 +81,45 @@ class ResourceScheduler:
 
     def zonal_workers(self, window_count: int, bytes_per_worker: int) -> int:
         cpus = self.budget.logical_cpus
-        default_workers = max(1, min(12, cpus - 2 if cpus > 3 else cpus))
+        default_workers = max(1, min(32, round(cpus * 0.90)))
         requested = self.budget.raster_workers or default_workers
         memory_cap = max(1, self.memory_limit_bytes // max(1, bytes_per_worker))
         return max(1, min(window_count, requested, memory_cap))
 
     def ecognition_workers(self, requested: int | None = None) -> int:
-        physical = psutil.cpu_count(logical=False) or max(1, self.budget.logical_cpus // 2)
-        default_workers = min(12, max(2, physical - 2) if physical >= 6 else max(1, physical))
+        cpus = self.budget.logical_cpus
+        physical = psutil.cpu_count(logical=False) or max(1, cpus // 2)
+        default_workers = min(32, max(physical, round(cpus * 0.85)))
+        if cpus > 2:
+            default_workers = min(default_workers, cpus - 1)
         value = requested or self.budget.ecognition_workers or default_workers
-        # Calibrated eCognition 9 usage is ~0.65 GiB per worker (8.1 GiB at 12
-        # workers); keep a 1.3 GiB safety allowance per worker.
-        memory_cap = max(1, self.memory_limit_bytes // int(1.3 * 1024**3))
-        return max(1, min(value, memory_cap, self.budget.logical_cpus))
+        # Calibrated eCognition 9 usage is ~0.65 GiB per worker; use 0.78 GiB
+        # safety allowance so 90% RAM budget scales aggressively without OOM.
+        memory_cap = max(1, self.memory_limit_bytes // int(0.78 * 1024**3))
+        return max(1, min(value, memory_cap, cpus))
+
+    def ecognition_max_workers(self, requested: int | None = None) -> int:
+        """Upper ceiling for dynamic concurrency ramp-up when live RAM/CPU allow."""
+        if requested is not None:
+            return self.ecognition_workers(requested)
+        cpus = self.budget.logical_cpus
+        cpu_cap = max(1, min(32, round(cpus * 0.90)))
+        if cpus > 2:
+            cpu_cap = min(cpu_cap, cpus - 1)
+        memory_cap = max(1, self.memory_limit_bytes // int(0.72 * 1024**3))
+        return max(self.ecognition_workers(), min(cpu_cap, memory_cap))
 
     def postprocess_workers(self, requested: int | None = None) -> int:
-        value = requested or max(1, min(8, self.budget.logical_cpus // 2))
-        memory_cap = max(1, self.memory_limit_bytes // (768 * 1024**2))
+        cpus = self.budget.logical_cpus
+        value = requested or max(2, min(24, round(cpus * 0.90)))
+        memory_cap = max(1, self.memory_limit_bytes // (512 * 1024**2))
         return max(1, min(value, memory_cap))
+
+    def prepare_workers(self) -> int:
+        return max(2, min(8, round(self.budget.logical_cpus * 0.40)))
+
+    def background_postprocess_workers(self) -> int:
+        return max(1, min(6, self.postprocess_workers() // 3))
+
+    def background_zonal_workers(self) -> int:
+        return max(2, min(8, round(self.budget.logical_cpus * 0.40)))

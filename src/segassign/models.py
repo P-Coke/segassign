@@ -12,6 +12,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from .ecognition import normalize_ecognition_bin
+
 
 def _absolute(value: str | os.PathLike[str]) -> Path:
     return Path(value).expanduser().resolve()
@@ -155,6 +157,7 @@ class SegmentRequest:
             "bridge",
         ):
             object.__setattr__(self, name, _absolute(getattr(self, name)))
+        object.__setattr__(self, "ecognition_bin", normalize_ecognition_bin(self.ecognition_bin))
         if self.output_vector.suffix.casefold() != ".shp":
             raise ValueError("segment output_vector must be a .shp path")
 
@@ -172,6 +175,7 @@ class SegmentBatchRequest:
     bridge: Path = field(default_factory=lambda: asset_path("vendor", "ecognition-9", "bridge.exe"))
     options: SegmentOptions = field(default_factory=SegmentOptions)
     recursive: bool = True
+    selected_inputs: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -184,6 +188,8 @@ class SegmentBatchRequest:
             "bridge",
         ):
             object.__setattr__(self, name, _absolute(getattr(self, name)))
+        object.__setattr__(self, "ecognition_bin", normalize_ecognition_bin(self.ecognition_bin))
+        object.__setattr__(self, "selected_inputs", _paths(self.selected_inputs))
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,10 +235,12 @@ class ZonalBatchRequest:
     output_directory: Path
     options: ZonalOptions = field(default_factory=ZonalOptions)
     recursive: bool = True
+    selected_inputs: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("vector_source", "raster", "output_directory"):
             object.__setattr__(self, name, _absolute(getattr(self, name)))
+        object.__setattr__(self, "selected_inputs", _paths(self.selected_inputs))
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +268,7 @@ class CompositeRequest:
             "bridge",
         ):
             object.__setattr__(self, name, _absolute(getattr(self, name)))
+        object.__setattr__(self, "ecognition_bin", normalize_ecognition_bin(self.ecognition_bin))
         if self.output_vector.suffix.casefold() != ".shp":
             raise ValueError("composite output_vector must be a .shp path")
 
@@ -279,6 +288,7 @@ class CompositeBatchRequest:
     segment_options: SegmentOptions = field(default_factory=SegmentOptions)
     zonal_options: ZonalOptions = field(default_factory=ZonalOptions)
     recursive: bool = True
+    selected_inputs: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -292,6 +302,8 @@ class CompositeBatchRequest:
             "bridge",
         ):
             object.__setattr__(self, name, _absolute(getattr(self, name)))
+        object.__setattr__(self, "ecognition_bin", normalize_ecognition_bin(self.ecognition_bin))
+        object.__setattr__(self, "selected_inputs", _paths(self.selected_inputs))
 
 
 @dataclass(frozen=True, slots=True)

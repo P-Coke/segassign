@@ -12,21 +12,24 @@ import psutil
 class PeakMemoryTracker(AbstractContextManager["PeakMemoryTracker"]):
     """Sample this process and its children without holding up useful work."""
 
-    def __init__(self, interval: float = 0.5) -> None:
-        self.interval = interval
+    def __init__(self, interval: float = 3.0) -> None:
+        self.interval = max(0.5, float(interval))
         self.peak_bytes = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    def _sample_once(self, process: psutil.Process) -> None:
+        try:
+            current = process.memory_info().rss
+            current += sum(child.memory_info().rss for child in process.children(recursive=True))
+            self.peak_bytes = max(self.peak_bytes, current)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
     def _sample(self) -> None:
         process = psutil.Process()
         while not self._stop.is_set():
-            try:
-                current = process.memory_info().rss
-                current += sum(child.memory_info().rss for child in process.children(recursive=True))
-                self.peak_bytes = max(self.peak_bytes, current)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+            self._sample_once(process)
             self._stop.wait(self.interval)
 
     @property

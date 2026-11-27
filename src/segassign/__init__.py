@@ -1,6 +1,7 @@
 """Public package for the SegAssign backend."""
 
 from . import composite, segment, zonal
+from .ecognition import detect_ecognition_bin, discover_ecognition_bins, resolve_ecognition_bin
 from .models import (
     CompositeBatchRequest,
     CompositeBatchResult,
@@ -44,6 +45,9 @@ __all__ = [
     "ZonalRequest",
     "ZonalResult",
     "composite",
+    "detect_ecognition_bin",
+    "discover_ecognition_bins",
+    "resolve_ecognition_bin",
     "segment",
     "zonal",
 ]

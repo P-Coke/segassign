@@ -7,6 +7,8 @@ import math
 import os
 import shutil
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -189,45 +191,150 @@ def detect_hardware() -> HardwareProfile:
     )
 
 
+def configure_gdal_cache(profile: HardwareProfile | None = None) -> int:
+    """Tune GDAL_CACHEMAX to ~8% of total RAM (256-2048 MB) unless explicitly set."""
+    existing = os.environ.get("GDAL_CACHEMAX", "").strip()
+    if existing:
+        try:
+            return int(existing)
+        except ValueError:
+            return 0
+    total_gb = profile.total_memory_gb if profile is not None else psutil.virtual_memory().total / 1024**3
+    cache_mb = max(256, min(2048, int(round(total_gb * 1024 * 0.08))))
+    os.environ["GDAL_CACHEMAX"] = str(cache_mb)
+    return cache_mb
+
+
 def build_resource_budget(profile: HardwareProfile, mode: str = "auto") -> ResourceBudget:
-    """Translate hardware profile + user performance mode into calibrated worker limits."""
+    """Translate hardware profile + performance mode into aggressive, RAM-guarded worker limits."""
     phys = profile.physical_cores
     logical = profile.logical_cpus
-    # Guard against OOM when other apps already occupy RAM.
-    avail_ratio = profile.available_memory_gb / max(profile.total_memory_gb, 0.5)
-    mem_headroom_gb = max(2.0, min(profile.total_memory_gb * 0.85, profile.available_memory_gb * 0.90 + 2.0))
 
     if mode == "low":
-        eco = max(2, min(4, phys // 3 or 1))
-        raster = max(1, min(4, phys // 3 or 1))
+        eco = max(2, min(6, phys // 2 or 1))
+        raster = max(2, min(6, max(1, round(logical * 0.40))))
         return ResourceBudget(
-            logical_cpus=max(1, logical // 2),
+            logical_cpus=max(1, round(logical * 0.50)),
             memory_fraction=0.55,
             ecognition_workers=eco,
             raster_workers=raster,
         )
+
     if mode == "high":
-        mem_cap = max(1, int(mem_headroom_gb / 1.1))
-        eco = max(1, min(14, phys, logical - 2 if logical > 3 else logical, mem_cap))
-        raster = max(1, min(14, phys, logical - 1 if logical > 2 else logical))
+        # Push up to ~95% CPU and ~92% total RAM while retaining an 8% OS floor.
+        safe_headroom_gb = max(
+            1.5,
+            min(
+                profile.total_memory_gb * 0.92,
+                profile.available_memory_gb - profile.total_memory_gb * 0.08 + 2.0,
+            ),
+        )
+        mem_cap = max(1, int(safe_headroom_gb / 0.68))
+        cpu_cap = max(1, logical - 1 if logical > 2 else logical)
+        eco_target = min(32, cpu_cap, max(phys + 2, round(logical * 0.90)))
+        eco = max(1, min(eco_target, mem_cap))
+        raster = max(1, min(32, cpu_cap))
         return ResourceBudget(
             logical_cpus=logical,
-            memory_fraction=0.90,
+            memory_fraction=0.92,
             ecognition_workers=eco,
             raster_workers=raster,
         )
-    # Default "auto" (自动最优): match physical cores minus OS headroom, bounded by available RAM.
-    mem_cap = max(1, int(mem_headroom_gb / 1.3))
-    eco_target = max(2, phys - 2) if phys >= 6 else max(1, phys - 1)
-    eco = max(1, min(12, eco_target, mem_cap))
-    raster = max(1, min(12, eco_target))
-    mem_frac = round(min(0.85, max(0.60, avail_ratio * 0.90 + 0.10)), 2)
+
+    # Default "auto" (自动极速 · 动态 90% 调优): target ~90% CPU and ~90% total RAM.
+    # Calibrated eCognition 9 usage is ~0.65 GiB/worker; 0.78 GiB/worker preserves burst headroom.
+    reserve_gb = profile.total_memory_gb * 0.10
+    safe_headroom_gb = max(
+        1.6,
+        min(
+            profile.total_memory_gb * 0.90,
+            profile.available_memory_gb - reserve_gb + min(2.0, profile.total_memory_gb * 0.08),
+        ),
+    )
+    mem_cap = max(1, int(safe_headroom_gb / 0.78))
+    cpu_90 = max(1, min(32, round(logical * 0.90)))
+    eco_target = min(cpu_90, max(phys, round(logical * 0.85)))
+    if logical > 2:
+        eco_target = min(eco_target, logical - 1)
+    eco = max(1, min(eco_target, mem_cap))
+    raster = max(1, min(32, cpu_90))
     return ResourceBudget(
         logical_cpus=logical,
-        memory_fraction=mem_frac,
+        memory_fraction=0.90,
         ecognition_workers=eco,
         raster_workers=raster,
     )
+
+
+class DynamicAutoTuner:
+    """Low-overhead runtime concurrency controller targeting ~90% CPU & RAM safely."""
+
+    def __init__(
+        self,
+        *,
+        initial_workers: int,
+        min_workers: int,
+        max_workers: int,
+        target_cpu_pct: float = 90.0,
+        target_ram_pct: float = 90.0,
+        sample_interval: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
+        sampler: Callable[[], tuple[float, float]] | None = None,
+    ) -> None:
+        self.min_workers = max(1, int(min_workers))
+        self.max_workers = max(self.min_workers, int(max_workers))
+        self.current_workers = max(self.min_workers, min(self.max_workers, int(initial_workers)))
+        self.target_cpu_pct = float(target_cpu_pct)
+        self.target_ram_pct = float(target_ram_pct)
+        self.sample_interval = max(0.5, float(sample_interval))
+        self._clock = clock
+        self._sampler = sampler or self._default_sample
+        self._last_sample_at = self._clock()
+        self.adjustments = 0
+        self.peak_workers = self.current_workers
+        self.min_observed_workers = self.current_workers
+        if sampler is None:
+            # Prime psutil's non-blocking CPU counter once.
+            psutil.cpu_percent(interval=None)
+
+    @staticmethod
+    def _default_sample() -> tuple[float, float]:
+        return float(psutil.cpu_percent(interval=None)), float(psutil.virtual_memory().percent)
+
+    def recommended_concurrency(self) -> int:
+        now = self._clock()
+        if (now - self._last_sample_at) < self.sample_interval:
+            return self.current_workers
+        self._last_sample_at = now
+        try:
+            cpu_pct, ram_pct = self._sampler()
+        except Exception:
+            return self.current_workers
+
+        previous = self.current_workers
+        if ram_pct >= self.target_ram_pct:
+            step = 2 if ram_pct >= self.target_ram_pct + 3.0 else 1
+            self.current_workers = max(self.min_workers, self.current_workers - step)
+        elif cpu_pct >= min(98.5, self.target_cpu_pct + 6.0) and ram_pct >= self.target_ram_pct - 5.0:
+            self.current_workers = max(self.min_workers, self.current_workers - 1)
+        elif ram_pct <= self.target_ram_pct - 4.0 and cpu_pct <= self.target_cpu_pct - 3.0:
+            self.current_workers = min(self.max_workers, self.current_workers + 1)
+
+        if self.current_workers != previous:
+            self.adjustments += 1
+            self.peak_workers = max(self.peak_workers, self.current_workers)
+            self.min_observed_workers = min(self.min_observed_workers, self.current_workers)
+        return self.current_workers
+
+    def summary(self) -> dict[str, int | float]:
+        return {
+            "target_cpu_pct": self.target_cpu_pct,
+            "target_ram_pct": self.target_ram_pct,
+            "max_workers": self.max_workers,
+            "peak_workers": self.peak_workers,
+            "min_observed_workers": self.min_observed_workers,
+            "adjustments": self.adjustments,
+        }
 
 
 def adapt_tile_size(

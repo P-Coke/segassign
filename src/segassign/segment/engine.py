@@ -177,7 +177,7 @@ def _invoke(command: list[str], cwd: Path, environment: dict[str, str], timeout:
             stdout, stderr = process.communicate()
             raise subprocess.TimeoutExpired(command, timeout, stdout, stderr)
         try:
-            stdout, stderr = process.communicate(timeout=0.2)
+            stdout, stderr = process.communicate(timeout=0.5)
             return int(process.returncode), stdout or "", stderr or ""
         except subprocess.TimeoutExpired:
             continue

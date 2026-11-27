@@ -23,10 +23,12 @@ hidden_imports = [
     "pyogrio.raw",
     *collect_submodules("rasterio"),
     *collect_submodules("pyproj"),
+    "segassign.ecognition",
     "segassign.raster_batch",
     "segassign.runtime.hardware",
     "segassign.segment.batch",
     "segassign.ui.main_window",
+    "segassign.ui.tile_map",
     "segassign.zonal.batch",
 ]
 
