@@ -23,6 +23,17 @@ _BUS_NAMES = {
 }
 _MIN_CACHE_FREE_GB = 20.0
 _CACHE_DIR_NAME = "SegAssign-Cache"
+FULL_LOAD_PHYSICAL_CORE_THRESHOLD = 8
+FULL_LOAD_LOGICAL_CPU_THRESHOLD = 12
+MAX_AUTO_WORKERS = 48
+
+
+def is_low_core_host(profile: HardwareProfile) -> bool:
+    """Return True for modest-core machines that should run at 100% thread utilization directly."""
+    return (
+        profile.physical_cores <= FULL_LOAD_PHYSICAL_CORE_THRESHOLD
+        or profile.logical_cpus <= FULL_LOAD_LOGICAL_CPU_THRESHOLD
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,30 +217,32 @@ def configure_gdal_cache(profile: HardwareProfile | None = None) -> int:
 
 
 def build_resource_budget(profile: HardwareProfile, mode: str = "auto") -> ResourceBudget:
-    """Translate hardware profile + performance mode into high-throughput worker limits.
+    """Translate target-machine CPU cores + RAM into tiered dynamic worker limits.
 
-    Uses total physical RAM (not volatile Windows standby-compressed available RAM) as the primary
-    sizing basis, while keeping a tight-RAM guardrail for small-memory machines (<= 16 GB with heavy
-    pre-existing usage).
+    - Low-core hosts (<= 8 physical cores or <= 12 logical threads): run at 100% logical threads
+      directly in 'auto' mode so modest machines never leave scarce cores idle.
+    - High-core hosts (> 8 physical cores and > 12 logical threads): target ~90% logical threads
+      (up to 48 workers) in 'auto' mode, leaving ~10% OS/I/O headroom.
     """
     phys = profile.physical_cores
     logical = profile.logical_cpus
+    low_core = is_low_core_host(profile)
 
     if mode == "low":
-        eco = max(2, min(8, phys // 2 or 1))
-        raster = max(2, min(8, max(1, round(logical * 0.45))))
+        eco = max(2, min(24, round(logical * 0.40))) if logical >= 4 else logical
+        raster = max(2, min(24, round(logical * 0.45))) if logical >= 4 else logical
         return ResourceBudget(
             logical_cpus=max(1, round(logical * 0.50)),
             memory_fraction=0.60,
-            ecognition_workers=eco,
-            raster_workers=raster,
+            ecognition_workers=min(logical, eco),
+            raster_workers=min(logical, raster),
         )
 
     if mode == "high":
-        # Maximum throughput: saturate up to 100% logical threads bounded only by total RAM (~95%).
+        # Maximum throughput: saturate up to 100% logical threads (capped at 48) bounded by 95% RAM.
         mem_cap = max(2, int((profile.total_memory_gb * 0.95) / 0.65))
-        eco = max(2, min(32, logical, mem_cap))
-        raster = max(2, min(32, logical))
+        eco = max(1, min(MAX_AUTO_WORKERS, logical, mem_cap))
+        raster = max(1, min(MAX_AUTO_WORKERS, logical))
         return ResourceBudget(
             logical_cpus=logical,
             memory_fraction=0.95,
@@ -237,22 +250,27 @@ def build_resource_budget(profile: HardwareProfile, mode: str = "auto") -> Resou
             raster_workers=raster,
         )
 
-    # Default "auto" (自动极速 · 90% 满载): immediately launch at ~90% logical threads without being
-    # crippled by Windows standby file cache; only scale back on genuinely low-memory hosts.
-    usable_gb = profile.total_memory_gb * 0.88
+    # Default "auto": low-core hosts go straight to 100% full load; multi-core hosts target ~90%.
+    mem_fraction = 0.92 if low_core else 0.90
+    usable_gb = profile.total_memory_gb * (0.90 if low_core else 0.88)
     if profile.available_memory_gb < min(6.0, profile.total_memory_gb * 0.30):
-        # Genuinely tight RAM (e.g. 8-16 GB host with < 4-6 GB free): avoid swap thrashing.
         usable_gb = max(2.5, profile.available_memory_gb * 1.15)
     mem_cap = max(2, int(usable_gb / 0.68))
-    cpu_90 = max(2, min(32, round(logical * 0.90)))
-    eco_target = max(phys, cpu_90)
-    if logical > 2:
-        eco_target = min(eco_target, logical - 1)
-    eco = max(2, min(32, eco_target, mem_cap))
-    raster = max(2, min(32, cpu_90))
+
+    if low_core:
+        cpu_target = max(1, min(MAX_AUTO_WORKERS, logical))
+        eco_target = cpu_target
+    else:
+        cpu_target = max(2, min(MAX_AUTO_WORKERS, round(logical * 0.90)))
+        eco_target = min(MAX_AUTO_WORKERS, max(phys, cpu_target))
+        if logical > 2:
+            eco_target = min(eco_target, logical - 1)
+
+    eco = max(1, min(eco_target, mem_cap))
+    raster = max(1, min(MAX_AUTO_WORKERS, cpu_target))
     return ResourceBudget(
         logical_cpus=logical,
-        memory_fraction=0.90,
+        memory_fraction=mem_fraction,
         ecognition_workers=eco,
         raster_workers=raster,
     )

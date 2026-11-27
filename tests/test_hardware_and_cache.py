@@ -23,6 +23,7 @@ from segassign.runtime import (
     cache_usage_bytes,
     clear_cache,
     configure_gdal_cache,
+    is_low_core_host,
     prune_expired_cache,
     select_best_cache_drive,
 )
@@ -76,6 +77,21 @@ def test_build_resource_budget_scales_aggressively_to_90pct_and_guards_tight_ram
     )
     auto_tight = build_resource_budget(tight_ram, "auto")
     assert auto_tight.ecognition_workers <= 7
+
+
+def test_low_core_hosts_run_at_100pct_full_load_and_high_core_scales_to_48():
+    for phys, logical, ram in ((2, 4, 8.0), (4, 4, 8.0), (4, 8, 16.0), (6, 12, 16.0), (8, 16, 32.0)):
+        host = HardwareProfile(phys, logical, ram, ram * 0.6, Path("D:/SegAssign-Cache"), "D: (NVMe)")
+        assert is_low_core_host(host)
+        budget = build_resource_budget(host, "auto")
+        assert budget.ecognition_workers == logical
+        assert budget.raster_workers == logical
+
+    workstation = HardwareProfile(32, 64, 128.0, 96.0, Path("D:/SegAssign-Cache"), "D: (NVMe)")
+    assert not is_low_core_host(workstation)
+    ws_auto = build_resource_budget(workstation, "auto")
+    assert ws_auto.ecognition_workers == 48
+    assert ws_auto.raster_workers == 48
 
 
 def test_dynamic_auto_tuner_ignores_high_cpu_and_uses_hysteresis_on_ram_pressure(monkeypatch):

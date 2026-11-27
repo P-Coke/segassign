@@ -64,6 +64,7 @@ from ..runtime import (
     clear_cache,
     configure_gdal_cache,
     detect_hardware,
+    is_low_core_host,
     prune_expired_cache,
 )
 from .controller import TaskController
@@ -1070,8 +1071,9 @@ class MainWindow(QMainWindow):
         zonal_w = scheduler.zonal_workers(1024, 3072**2 * 16)
         mem_pct = int(budget.memory_fraction * 100)
         eco_text = f"{eco}→{eco_max}" if eco_max > eco else f"{eco}"
+        tier_tag = "低核自动满载" if is_low_core_host(hw) else "多核动态 90%"
         self.worker_hint.setText(
-            f"动态并发：分割 {eco_text} · 后处理 {post} · 赋值 {zonal_w}（目标上限 {mem_pct}%）"
+            f"策略：{tier_tag} · 分割 {eco_text} · 后处理 {post} · 赋值 {zonal_w}（上限 {mem_pct}%）"
         )
 
     def _backend(self):

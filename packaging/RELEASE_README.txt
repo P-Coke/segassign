@@ -1,4 +1,4 @@
-SegAssign 2.2.1 Windows x64
+SegAssign 2.2.2 Windows x64
 ============================
 
 启动方式

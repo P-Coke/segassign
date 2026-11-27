@@ -10,6 +10,7 @@ from .hardware import (
     configure_gdal_cache,
     detect_hardware,
     discover_drives,
+    is_low_core_host,
     select_best_cache_drive,
 )
 from .metrics import PeakMemoryTracker, StageTimer
@@ -37,6 +38,7 @@ __all__ = [
     "configure_gdal_cache",
     "detect_hardware",
     "discover_drives",
+    "is_low_core_host",
     "prune_expired_cache",
     "select_best_cache_drive",
 ]
